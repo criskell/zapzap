@@ -1,0 +1,8 @@
+[package]
+name = "bakeemoji"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+png = "0.17"
+ttf-parser = "0.25"

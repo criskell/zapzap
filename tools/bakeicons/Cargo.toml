@@ -1,0 +1,8 @@
+[package]
+name = "bakeicons"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+png = "0.17"
+resvg = { version = "0.45", default-features = false }

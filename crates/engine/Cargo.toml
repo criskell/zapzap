@@ -1,0 +1,16 @@
+[package]
+name = "zapzap-engine"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zapzap-engine"
+path = "src/main.rs"
+
+[dependencies]
+whatsapp-rust = { version = "0.7", default-features = false, features = ["tokio-runtime", "tokio-transport", "ureq-client", "sqlite-storage"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+zapzap-core = { path = "../core" }
+
+[dev-dependencies]
+flate2 = "1"

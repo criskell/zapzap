@@ -1,0 +1,8 @@
+[package]
+name = "bakefont"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ab_glyph_rasterizer = "0.1"
+ttf-parser = "0.25"

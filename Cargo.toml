@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/ui", "crates/core", "crates/engine", "crates/qr", "tools/bakefont", "tools/bakeemoji", "tools/fonttest", "tools/bakeicons"]
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
