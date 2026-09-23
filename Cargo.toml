@@ -8,3 +8,17 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The engine builds against a local fork of whatsapp-rust (../whatsapp-rust) that is trimmed to what ZapZap uses.
+[patch.crates-io]
+whatsapp-rust = { path = "../whatsapp-rust" }
+wacore = { path = "../whatsapp-rust/wacore" }
+wacore-appstate = { path = "../whatsapp-rust/wacore/appstate" }
+wacore-binary = { path = "../whatsapp-rust/wacore/binary" }
+wacore-derive = { path = "../whatsapp-rust/wacore/derive" }
+wacore-libsignal = { path = "../whatsapp-rust/wacore/libsignal" }
+wacore-noise = { path = "../whatsapp-rust/wacore/noise" }
+waproto = { path = "../whatsapp-rust/waproto" }
+whatsapp-rust-sqlite-storage = { path = "../whatsapp-rust/storages/sqlite-storage" }
+whatsapp-rust-tokio-transport = { path = "../whatsapp-rust/transports/tokio-transport" }
+whatsapp-rust-ureq-http-client = { path = "../whatsapp-rust/http_clients/ureq-client" }

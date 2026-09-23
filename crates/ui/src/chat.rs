@@ -4,8 +4,8 @@
 use crate::font;
 use crate::platform::{sys, EditKey, Key};
 
-pub const MAX_CHATS: usize = 16;
-const MAX_MESSAGES: usize = 128;
+pub const MAX_CHATS: usize = 48;
+const MAX_MESSAGES: usize = 384;
 const FIND_CAPACITY: usize = 48;
 /// WhatsApp's message ids are shorter than this; a longer one is cut.
 /// Sends `head`, the two-digit number of `chat` and `tail` to the core.
@@ -21,6 +21,25 @@ fn write_command(head: &[u8], chat: usize, tail: &[u8]) {
 
 /// Kinds of emoji a message shows in its reaction pill.
 pub const TALLY: usize = 3;
+/// Kinds of what a message carries, as the `MEDIA` line numbers them.
+pub const MEDIA_IMAGE: u8 = 1;
+pub const MEDIA_VIDEO: u8 = 2;
+pub const MEDIA_AUDIO: u8 = 3;
+pub const MEDIA_DOCUMENT: u8 = 4;
+pub const MEDIA_STICKER: u8 = 5;
+const LABEL_CAPACITY: usize = 40;
+/// Width of a photo's box, and the bounds of its height; voice and document boxes have fixed sizes.
+const MEDIA_W: i32 = 240;
+const MEDIA_MIN_H: i32 = 90;
+const MEDIA_MAX_H: i32 = 300;
+const AUDIO_H: i32 = 44;
+const DOCUMENT_H: i32 = 60;
+/// Space between a message's box and its text.
+pub const BLOCK_GAP: i32 = 4;
+/// Preview pictures kept at a time, each at most this many pixels on a side.
+pub const THUMB_SLOTS: usize = 6;
+pub const THUMB_SIDE: usize = 48;
+
 /// Height of a row of the favourite messages panel.
 pub const STARRED_ROW_H: i32 = 76;
 pub const ID_CAPACITY: usize = 24;
@@ -79,6 +98,8 @@ pub const TICKS_WIDTH: i32 = 18;
 /// Room above the first bubble for the date chip.
 pub const CONVERSATION_TOP: i32 = 52;
 const CONVERSATION_BOTTOM: i32 = 16;
+/// The row a day chip takes above the first message of a day (chip 26 px high, 14 above and 12 below).
+pub const DAY_CHIP_ROW: i32 = 38;
 const SAME_SENDER_GAP: i32 = 3;
 const OTHER_SENDER_GAP: i32 = 12;
 /// Brazil is one time zone for practical purposes: Brasilia time, UTC-3, no daylight saving.
@@ -200,6 +221,8 @@ pub const NEW_CHAT_TOP: i32 = 122;
 pub const NEW_CHAT_ACTION_H: i32 = 64;
 pub const NEW_CHAT_ROW_H: i32 = 72;
 pub const NEW_CHAT_SELF_TOP: i32 = 323;
+/// The name of the conversation with ourselves.
+pub const SELF_CHAT: &str = "Você";
 pub const NEW_CHAT_ACTIONS: [&str; 3] = ["Novo grupo", "Novo contato", "Nova comunidade"];
 
 /// The rows of the new-conversation panel, in drawing order.
@@ -209,6 +232,29 @@ pub enum ContactsItem {
     Myself,
     Letter(char),
     Contact(usize),
+    /// The number typed in the search box, as a conversation to start.
+    Number,
+}
+
+/// The most digits a phone number can have (E.164).
+pub const PHONE_DIGITS: usize = 15;
+
+/// The digits of `text` when it reads as a phone number (digits, an optional plus, spaces, dashes and
+/// parentheses, at least eight digits); how many were written into `digits`.
+pub fn phone_digits(text: &str, digits: &mut [u8; PHONE_DIGITS]) -> Option<usize> {
+    let mut count = 0;
+    for (index, c) in text.chars().enumerate() {
+        match c {
+            '0'..='9' if count < PHONE_DIGITS => {
+                digits[count] = c as u8;
+                count += 1;
+            }
+            '+' if index == 0 => {}
+            ' ' | '-' | '(' | ')' => {}
+            _ => return None,
+        }
+    }
+    (count >= 8).then_some(count)
 }
 
 /// The letter a contact is filed under: its initial without accent, or `#`.
@@ -617,13 +663,54 @@ pub struct Message {
     pub deleted: bool,
     /// Marked as a favourite: a small star before the time.
     pub starred: bool,
+    /// The calendar day it was sent, in days since 1970-01-01 (Brasilia time).
+    pub day: u16,
+    /// What it carries besides text (`MEDIA_*`), the picture's size, and a short label (a file name or a duration).
+    pub kind: u8,
+    media_w: u16,
+    media_h: u16,
+    label: [u8; LABEL_CAPACITY],
+    label_len: u8,
+    /// The preview picture: 0 not asked for, 1 asked, 2 in `slot` of the pool, 3 there is none.
+    pub thumb: u8,
+    slot: u8,
 }
 
 impl Message {
-    const EMPTY: Message = Message { chat: 0, outgoing: false, delivery: Delivery::Delivered, time: [b'0'; 5], len: 0, height: 0, text: [0; MESSAGE_CAPACITY], id: [0; ID_CAPACITY], id_len: 0, reply: [0; ID_CAPACITY], reply_len: 0, tally: [0; TALLY], counts: [0; TALLY], mine: 0, deleted: false, starred: false };
+    const EMPTY: Message = Message { chat: 0, outgoing: false, delivery: Delivery::Delivered, time: [b'0'; 5], len: 0, height: 0, text: [0; MESSAGE_CAPACITY], id: [0; ID_CAPACITY], id_len: 0, reply: [0; ID_CAPACITY], reply_len: 0, tally: [0; TALLY], counts: [0; TALLY], mine: 0, deleted: false, starred: false, day: 0, kind: 0, media_w: 0, media_h: 0, label: [0; LABEL_CAPACITY], label_len: 0, thumb: 0, slot: 0 };
 
     pub fn text(&self) -> &str {
         core::str::from_utf8(&self.text[..self.len as usize]).unwrap_or("")
+    }
+
+    pub fn label(&self) -> &str {
+        core::str::from_utf8(&self.label[..self.label_len as usize]).unwrap_or("")
+    }
+
+    /// The size of the box that shows what the message carries: (width, height), (0, 0) for none.
+    pub fn block(&self) -> (i32, i32) {
+        match self.kind {
+            MEDIA_IMAGE | MEDIA_VIDEO | MEDIA_STICKER => {
+                let (w, h) = (self.media_w as i32, self.media_h as i32);
+                let height = if w > 0 && h > 0 { MEDIA_W * h / w } else { MEDIA_W * 3 / 4 };
+                (MEDIA_W, height.clamp(MEDIA_MIN_H, MEDIA_MAX_H))
+            }
+            MEDIA_AUDIO => (MEDIA_W - 10, AUDIO_H),
+            MEDIA_DOCUMENT => (MEDIA_W - 10, DOCUMENT_H),
+            _ => (0, 0),
+        }
+    }
+
+    /// What the conversation list shows for a message without text.
+    pub fn kind_word(&self) -> &'static str {
+        match self.kind {
+            MEDIA_IMAGE => "Foto",
+            MEDIA_VIDEO => "Vídeo",
+            MEDIA_AUDIO => "Mensagem de voz",
+            MEDIA_DOCUMENT => "Documento",
+            MEDIA_STICKER => "Figurinha",
+            _ => "",
+        }
     }
 
     /// Takes our emoji out of the tally.
@@ -699,6 +786,17 @@ pub struct Chat {
     pub below_count: u8,
     /// The message the pointer is over (its reaction button shows), and the message an open emoji picker reacts to.
     pub hover: Option<usize>,
+    /// Waiting for older messages of the open conversation (`OLDER`): when it was asked (0: not waiting) and
+    /// how tall the conversation was then. `exhausted` marks the conversations that have no more.
+    older_asked: i64,
+    older_content: i32,
+    exhausted: u64,
+    /// The pool of preview pictures (RGB565, `THUMB_SIDE` wide rows), their sizes, and the next slot to reuse.
+    thumbs: [[u16; THUMB_SIDE * THUMB_SIDE]; THUMB_SLOTS],
+    thumb_size: [(u8, u8); THUMB_SLOTS],
+    thumb_next: u8,
+    /// When the preview asked for last was asked (0: none is pending).
+    thumb_asked: i64,
     pub picker_reaction: Option<usize>,
     /// The message marked after a jump from a quote, until the next key, click or scroll.
     pub flash: Option<usize>,
@@ -818,7 +916,7 @@ pub fn meta_width(time: &str, outgoing: bool, starred: bool) -> i32 {
 }
 
 /// `quote_width` is the width of the quoted message's block, or 0 when the bubble quotes nothing.
-pub fn bubble_shape(text: &str, time: &str, outgoing: bool, starred: bool, text_limit: i32, quote_width: i32) -> BubbleShape {
+pub fn bubble_shape(text: &str, time: &str, outgoing: bool, starred: bool, text_limit: i32, quote_width: i32, block: (i32, i32)) -> BubbleShape {
     let meta = meta_width(time, outgoing, starred);
     let (mut count, mut widest, mut last) = (0, 0, 0);
     for line in font::lines(text, BODY, text_limit) {
@@ -828,8 +926,8 @@ pub fn bubble_shape(text: &str, time: &str, outgoing: bool, starred: bool, text_
         last = width;
     }
     let time_inline = last + META_GAP + meta <= text_limit;
-    let width = if time_inline { widest.max(last + META_GAP + meta) } else { widest.max(meta) }.max(quote_width);
-    let height = 2 * BUBBLE_PAD_Y + count.max(1) * LINE_HEIGHT + if time_inline { 0 } else { META_ROW } + if quote_width > 0 { QUOTE_H } else { 0 };
+    let width = if time_inline { widest.max(last + META_GAP + meta) } else { widest.max(meta) }.max(quote_width).max(block.0);
+    let height = 2 * BUBBLE_PAD_Y + count.max(1) * LINE_HEIGHT + if time_inline { 0 } else { META_ROW } + if quote_width > 0 { QUOTE_H } else { 0 } + if block.1 > 0 { block.1 + BLOCK_GAP } else { 0 };
     BubbleShape { width, height, time_inline }
 }
 
@@ -912,6 +1010,70 @@ fn compose(accent: char, base: char) -> Option<char> {
     None
 }
 
+/// Today, in days since 1970-01-01 (Brasilia time).
+pub fn today() -> u16 {
+    ((sys::unix_seconds() + BRASILIA_OFFSET_SECONDS).div_euclid(86_400)) as u16
+}
+
+/// The time and the day of a `MSG` time field: "HH:MM", optionally followed by a space and the day
+/// number; without one the message is from today (0).
+fn split_stamp(time: &str) -> ([u8; 5], u16) {
+    let mut stamp = [b' '; 5];
+    let (clock, day) = time.split_once(' ').unwrap_or((time, ""));
+    let len = clock.len().min(5);
+    stamp[..len].copy_from_slice(&clock.as_bytes()[..len]);
+    (stamp, day.trim().parse().unwrap_or(0))
+}
+
+const WEEKDAYS: [&str; 7] = ["DOMINGO", "SEGUNDA-FEIRA", "TERÇA-FEIRA", "QUARTA-FEIRA", "QUINTA-FEIRA", "SEXTA-FEIRA", "SÁBADO"];
+const WEEKDAYS_SHORT: [&str; 7] = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
+
+/// (year, month, day) of a day count since 1970-01-01 (Howard Hinnant's civil-from-days).
+fn civil_date(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(month <= 2), month, day)
+}
+
+/// "dd/mm/aaaa" in `buffer`.
+fn date_text(day: u16, buffer: &mut [u8; 10]) -> &str {
+    let (year, month, date) = civil_date(day as i64);
+    let digits = [date / 10, date % 10, -1, month / 10, month % 10, -1, year / 1000, year / 100 % 10, year / 10 % 10, year % 10];
+    for (slot, digit) in buffer.iter_mut().zip(digits) {
+        *slot = if digit < 0 { b'/' } else { b'0' + digit as u8 };
+    }
+    core::str::from_utf8(&buffer[..]).unwrap_or("")
+}
+
+/// The chip above the messages of one day: HOJE, ONTEM, the weekday for the last week, else the date.
+pub fn day_chip(day: u16, buffer: &mut [u8; 10]) -> &str {
+    let ago = today().saturating_sub(day);
+    match ago {
+        0 => "HOJE",
+        1 => "ONTEM",
+        2..=6 => WEEKDAYS[(day as usize + 4) % 7],
+        _ => date_text(day, buffer),
+    }
+}
+
+/// What the conversation list shows for the last message: its time today, else Ontem, the weekday's
+/// first letters for the last week, else the date.
+pub fn list_day<'a>(day: u16, clock: &'a str, buffer: &'a mut [u8; 10]) -> &'a str {
+    let ago = today().saturating_sub(day);
+    match ago {
+        0 => clock,
+        1 => "Ontem",
+        2..=6 => WEEKDAYS_SHORT[(day as usize + 4) % 7],
+        _ => date_text(day, buffer),
+    }
+}
+
 fn clock(unix_seconds: i64) -> [u8; 5] {
     let day = (unix_seconds + BRASILIA_OFFSET_SECONDS).rem_euclid(86_400);
     let (hours, minutes) = ((day / 3600) as u8, (day % 3600 / 60) as u8);
@@ -932,6 +1094,13 @@ impl Chat {
             find_current: 0,
             below_count: 0,
             hover: None,
+            older_asked: 0,
+            older_content: 0,
+            exhausted: 0,
+            thumbs: [[0; THUMB_SIDE * THUMB_SIDE]; THUMB_SLOTS],
+            thumb_size: [(0, 0); THUMB_SLOTS],
+            thumb_next: 0,
+            thumb_asked: 0,
             picker_reaction: None,
             flash: None,
             reply_to: [0; ID_CAPACITY],
@@ -1022,6 +1191,9 @@ impl Chat {
         self.next_history_rank = HISTORY_RANK;
         self.next_live_rank = LIVE_RANK;
         self.message_count = 0;
+        self.older_asked = 0;
+        self.exhausted = 0;
+        self.thumb_asked = 0;
         self.live = false;
         self.open = false;
         self.selected = 0;
@@ -1355,6 +1527,27 @@ impl Chat {
         sys::write_all(1, &line[..10 + len]);
     }
 
+    /// Starts a conversation with the phone number typed in the search box (`OPENCHAT` with its digits).
+    pub fn pick_number(&mut self) {
+        let mut digits = [0u8; PHONE_DIGITS];
+        let Some(count) = phone_digits(self.search.text(), &mut digits) else { return };
+        let mut line = [0u8; PHONE_DIGITS + 10];
+        line[..9].copy_from_slice(b"OPENCHAT\t");
+        line[9..9 + count].copy_from_slice(&digits[..count]);
+        line[9 + count] = b'\n';
+        sys::write_all(1, &line[..10 + count]);
+    }
+
+    /// "Mensagens para mim": the conversation with ourselves (the core makes it when it does not exist).
+    pub fn pick_self(&mut self) {
+        if let Some(chat) = (0..MAX_CHATS).find(|&i| self.conversations[i].used && self.conversations[i].name() == SELF_CHAT) {
+            self.close_new_chat();
+            self.select(chat);
+            return;
+        }
+        sys::write_all(1, b"OPENCHAT\t\n");
+    }
+
     /// The core made (or found) conversation `chat`: leave the panel and show it.
     pub fn show_chat(&mut self, chat: usize) {
         if chat < MAX_CHATS && self.conversations[chat].used {
@@ -1375,6 +1568,10 @@ impl Chat {
             }
             visit(ContactsItem::Myself, NEW_CHAT_SELF_TOP);
             y = NEW_CHAT_SELF_TOP + NEW_CHAT_ROW_H;
+        }
+        if phone_digits(query, &mut [0u8; PHONE_DIGITS]).is_some() {
+            visit(ContactsItem::Number, y);
+            y += NEW_CHAT_ROW_H;
         }
         let mut letter = '\0';
         for index in (0..self.contact_count).filter(|&i| matches(self.contacts[i].name(), query)) {
@@ -1585,10 +1782,8 @@ impl Chat {
             return;
         }
         let at_bottom = chat == self.selected && self.conversation_scroll >= self.max_conversation_scroll() - 8;
-        let mut stamp = [b' '; 5];
-        let len = time.len().min(5);
-        stamp[..len].copy_from_slice(&time.as_bytes()[..len]);
-        self.push_message(chat, outgoing, if read { Delivery::Read } else { Delivery::Delivered }, text, stamp, id, reply);
+        let (stamp, day) = split_stamp(time);
+        self.push_message(chat, outgoing, if read { Delivery::Read } else { Delivery::Delivered }, text, stamp, day, id, reply);
         if self.live && !outgoing && chat != self.selected {
             self.conversations[chat].unread = self.conversations[chat].unread.saturating_add(1);
         }
@@ -1599,6 +1794,162 @@ impl Chat {
             self.conversation_scroll = self.max_conversation_scroll();
         } else if self.live && !outgoing && chat == self.selected && self.open {
             self.below_count = self.below_count.saturating_add(1);
+        }
+    }
+
+    // ---- photos, videos, voice messages and documents
+
+    /// Message `id` of `chat` carries something besides text (`MEDIA`).
+    pub fn set_media(&mut self, chat: usize, id: &str, kind: u8, width: u32, height: u32, label: &str) {
+        let Some(index) = self.message_with_id(chat as u8, id) else { return };
+        let message = &mut self.messages[index];
+        message.kind = kind;
+        message.media_w = width.min(u16::MAX as u32) as u16;
+        message.media_h = height.min(u16::MAX as u32) as u16;
+        store(&mut message.label, &mut message.label_len, label);
+        self.recompute_height(index);
+    }
+
+    /// The preview picture of message `id` starts arriving (`THUMB`): it takes the next slot of the pool.
+    pub fn thumb_start(&mut self, chat: usize, id: &str, width: usize, height: usize) {
+        let Some(index) = self.message_with_id(chat as u8, id) else { return };
+        if width == 0 || height == 0 || width > THUMB_SIDE || height > THUMB_SIDE {
+            self.thumb_asked = 0;
+            return;
+        }
+        let slot = self.thumb_next as usize % THUMB_SLOTS;
+        self.thumb_next = ((slot + 1) % THUMB_SLOTS) as u8;
+        // Whoever held the slot has to ask again if it is shown once more.
+        for other in self.messages[..self.message_count].iter_mut() {
+            if other.thumb == 2 && other.slot as usize == slot {
+                other.thumb = 0;
+            }
+        }
+        self.thumb_size[slot] = (width as u8, height as u8);
+        self.messages[index].slot = slot as u8;
+        self.messages[index].thumb = 1;
+    }
+
+    /// One row of pixels of the picture that is arriving, as hex of little-endian RGB565.
+    pub fn thumb_row(&mut self, chat: usize, id: &str, row: usize, hex: &[u8]) {
+        let Some(index) = self.message_with_id(chat as u8, id) else { return };
+        let message = &mut self.messages[index];
+        if message.thumb != 1 {
+            return;
+        }
+        let slot = message.slot as usize;
+        let (width, height) = (self.thumb_size[slot].0 as usize, self.thumb_size[slot].1 as usize);
+        if row >= height || hex.len() < width * 4 {
+            return;
+        }
+        let digit = |byte: u8| (byte as char).to_digit(16).unwrap_or(0) as u8;
+        for column in 0..width {
+            let at = column * 4;
+            let low = digit(hex[at]) << 4 | digit(hex[at + 1]);
+            let high = digit(hex[at + 2]) << 4 | digit(hex[at + 3]);
+            self.thumbs[slot][row * THUMB_SIDE + column] = (high as u16) << 8 | low as u16;
+        }
+        if row + 1 == height {
+            message.thumb = 2;
+            self.thumb_asked = 0;
+        }
+    }
+
+    /// The core has no preview for message `id` (`THUMBFAIL`).
+    pub fn thumb_failed(&mut self, chat: usize, id: &str) {
+        if let Some(index) = self.message_with_id(chat as u8, id) {
+            self.messages[index].thumb = 3;
+        }
+        self.thumb_asked = 0;
+    }
+
+    /// The preview picture of `message`: its pixels (rows `THUMB_SIDE` apart), width and height.
+    pub fn thumb_of(&self, message: &Message) -> Option<(&[u16], usize, usize)> {
+        if message.thumb != 2 {
+            return None;
+        }
+        let slot = message.slot as usize;
+        let (width, height) = self.thumb_size[slot];
+        Some((&self.thumbs[slot], width as usize, height as usize))
+    }
+
+    /// Asks the core for the preview of a photo or video that is on screen and has none (`THUMB chat id`),
+    /// one at a time.
+    pub fn request_thumbs(&mut self) {
+        let now = sys::monotonic_ms();
+        if !self.open || self.tab != Tab::Chats || self.selected >= MAX_CHATS || (self.thumb_asked != 0 && now - self.thumb_asked < 5000) {
+            return;
+        }
+        let (top, bottom) = (self.conversation_scroll - HEADER_H, self.conversation_scroll + self.viewport_height() + HEADER_H);
+        let mut wanted = None;
+        self.place(|message, y, _| {
+            let block = message.block();
+            if wanted.is_none() && message.thumb == 0 && message.id_len > 0 && (message.kind == MEDIA_IMAGE || message.kind == MEDIA_VIDEO) && y + block.1 >= top && y <= bottom {
+                wanted = Some((message.id, message.id_len as usize));
+            }
+        });
+        let Some((id, id_len)) = wanted else { return };
+        let chat = self.selected;
+        let mut line = [0u8; ID_CAPACITY + 16];
+        let head = write_send_head(&mut line, b"THUMB\t", chat);
+        line[head..head + id_len].copy_from_slice(&id[..id_len]);
+        line[head + id_len] = b'\n';
+        sys::write_all(1, &line[..head + id_len + 1]);
+        if let Some(index) = self.messages[..self.message_count].iter().position(|m| m.chat as usize == chat && m.id_len as usize == id_len && m.id[..id_len] == id[..id_len]) {
+            self.messages[index].thumb = 1;
+        }
+        self.thumb_asked = now;
+    }
+
+    /// An older message of `chat` from the core (`PAST`): it goes before the conversation's first one.
+    pub fn receive_older(&mut self, chat: usize, outgoing: bool, read: bool, time: &str, id: &str, reply: &str, text: &str) {
+        if chat >= MAX_CHATS || !self.conversations[chat].used {
+            return;
+        }
+        let (stamp, day) = split_stamp(time);
+        self.push_message(chat, outgoing, if read { Delivery::Read } else { Delivery::Delivered }, text, stamp, day, id, reply);
+        let last = self.message_count - 1;
+        if let Some(first) = self.messages[..last].iter().position(|m| m.chat as usize == chat) {
+            self.messages[first..=last].rotate_right(1);
+        }
+        // The numbers of the messages changed under these.
+        self.flash = None;
+        self.message_menu = None;
+        self.hover = None;
+    }
+
+    /// Asks the core for messages older than the first one of the open conversation, when the view is at
+    /// its top and there may be more (`OLDER chat id`).
+    pub fn request_older_if_top(&mut self) {
+        let now = sys::monotonic_ms();
+        if !self.open || self.tab != Tab::Chats || self.conversation_scroll > 0 || self.selected >= 64 || self.exhausted >> self.selected & 1 == 1 {
+            return;
+        }
+        if self.older_asked != 0 && now - self.older_asked < 4000 {
+            return;
+        }
+        let chat = self.selected;
+        let Some(first) = self.messages[..self.message_count].iter().find(|m| m.chat as usize == chat && m.id_len > 0) else { return };
+        let (id, id_len) = (first.id, first.id_len as usize);
+        let mut line = [0u8; ID_CAPACITY + 16];
+        let head = write_send_head(&mut line, b"OLDER\t", chat);
+        line[head..head + id_len].copy_from_slice(&id[..id_len]);
+        line[head + id_len] = b'\n';
+        sys::write_all(1, &line[..head + id_len + 1]);
+        self.older_asked = now;
+        self.older_content = self.place(|_, _, _| {});
+    }
+
+    /// The core has sent all it had for the open request (`PASTEND chat more`): keep the view on the
+    /// same messages.
+    pub fn older_done(&mut self, chat: usize, more: bool) {
+        self.older_asked = 0;
+        if !more && chat < 64 {
+            self.exhausted |= 1 << chat;
+        }
+        if chat == self.selected {
+            let grown = self.place(|_, _, _| {}) - self.older_content;
+            self.conversation_scroll += grown.max(0);
         }
     }
 
@@ -1715,7 +2066,7 @@ impl Chat {
         self.text_limit
     }
 
-    fn push_message(&mut self, chat: usize, outgoing: bool, delivery: Delivery, text: &str, time: [u8; 5], id: &str, reply: &str) {
+    fn push_message(&mut self, chat: usize, outgoing: bool, delivery: Delivery, text: &str, time: [u8; 5], day: u16, id: &str, reply: &str) {
         if self.message_count == MAX_MESSAGES {
             self.messages.rotate_left(1);
             self.message_count -= 1;
@@ -1738,6 +2089,10 @@ impl Chat {
         message.mine = 0;
         message.starred = false;
         message.deleted = false;
+        message.day = if day == 0 { today() } else { day };
+        message.kind = 0;
+        message.label_len = 0;
+        message.thumb = 0;
         let index = self.message_count;
         self.message_count += 1;
         self.recompute_height(index);
@@ -1747,7 +2102,7 @@ impl Chat {
     fn recompute_height(&mut self, index: usize) {
         let quote_width = self.quote_width(index);
         let message = &self.messages[index];
-        let shape = bubble_shape(message.text(), message.time(), message.outgoing, message.starred, self.text_limit, quote_width);
+        let shape = bubble_shape(message.text(), message.time(), message.outgoing, message.starred, self.text_limit, quote_width, message.block());
         let reactions = if message.tally[0] != 0 { REACTION_H } else { 0 };
         self.messages[index].height = (shape.height + reactions) as u16;
     }
@@ -1863,7 +2218,7 @@ impl Chat {
         sys::write_all(1, &line[..head + len + 1]);
         let text = self.forward_text;
         if let Ok(text) = core::str::from_utf8(&text[..len]) {
-            self.push_message(chat, true, Delivery::Sent, text, clock(sys::unix_seconds()), "", "");
+            self.push_message(chat, true, Delivery::Sent, text, clock(sys::unix_seconds()), 0, "", "");
             self.bump(chat);
         }
         if chat == self.selected {
@@ -2204,16 +2559,25 @@ impl Chat {
     /// Visits the bubbles of the open conversation with their top edge inside the scrolling
     /// content, and whether each one starts a new run from the same sender. Returns the content height.
     pub fn place(&self, mut visit: impl FnMut(&Message, i32, bool)) -> i32 {
-        let mut y = CONVERSATION_TOP;
+        let mut y = CONVERSATION_TOP - DAY_CHIP_ROW;
         let mut previous: Option<bool> = None;
+        let mut previous_day: Option<u16> = None;
         for message in self.messages[..self.message_count].iter().filter(|m| m.chat as usize == self.selected) {
-            let starts_run = previous != Some(message.outgoing);
+            let new_day = previous_day != Some(message.day);
+            let starts_run = new_day || previous != Some(message.outgoing);
             if previous.is_some() {
                 y += if starts_run { OTHER_SENDER_GAP } else { SAME_SENDER_GAP };
+            }
+            if new_day {
+                y += DAY_CHIP_ROW;
             }
             visit(message, y, starts_run);
             y += message.height as i32;
             previous = Some(message.outgoing);
+            previous_day = Some(message.day);
+        }
+        if previous.is_none() {
+            y += DAY_CHIP_ROW;
         }
         y + CONVERSATION_BOTTOM
     }
@@ -2491,7 +2855,7 @@ impl Chat {
         let mut text = [0u8; MESSAGE_CAPACITY];
         text[..len].copy_from_slice(&self.draft.bytes[..len]);
         if let (Ok(text), Ok(reply)) = (core::str::from_utf8(&text[..len]), core::str::from_utf8(&reply[..reply_len])) {
-            self.push_message(self.selected, true, Delivery::Sent, text, clock(sys::unix_seconds()), "", reply);
+            self.push_message(self.selected, true, Delivery::Sent, text, clock(sys::unix_seconds()), 0, "", reply);
             self.bump(self.selected);
         }
         self.draft.clear();

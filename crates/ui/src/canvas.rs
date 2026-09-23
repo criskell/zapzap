@@ -37,6 +37,14 @@ impl Canvas<'_> {
         *dst = (mix(16, coverage[0]) << 16) | (mix(8, coverage[1]) << 8) | mix(0, coverage[2]);
     }
 
+    /// Sets one pixel (inside the band).
+    pub fn put(&mut self, x: i32, y: i32, color: u32) {
+        let y = y - self.y0;
+        if x >= 0 && y >= 0 && x < self.w && y < self.rows {
+            self.px[(y * self.w + x) as usize] = color;
+        }
+    }
+
     pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
         let x0 = x.max(0);
         let x1 = (x + w).min(self.w);

@@ -16,6 +16,8 @@ pub enum Command {
     React { chat: usize, id: String, emoji: String },
     Star { chat: usize, id: String, starred: bool },
     MarkRead { chat: usize },
+    Older { chat: usize, id: String },
+    Thumb { chat: usize, id: String },
     Edit { chat: usize, id: String, text: String },
     Mute { chat: usize, muted: bool },
     ClearChat { chat: usize },
@@ -64,6 +66,14 @@ fn parse_command(line: &str) -> Option<Command> {
         let mut fields = rest.splitn(3, '\t');
         return Some(Command::React { chat: fields.next()?.parse().ok()?, id: fields.next()?.to_string(), emoji: fields.next()?.to_string() });
     }
+    if let Some(rest) = line.strip_prefix("THUMB\t") {
+        let mut fields = rest.splitn(2, '\t');
+        return Some(Command::Thumb { chat: fields.next()?.parse().ok()?, id: fields.next()?.to_string() });
+    }
+    if let Some(rest) = line.strip_prefix("OLDER\t") {
+        let mut fields = rest.splitn(2, '\t');
+        return Some(Command::Older { chat: fields.next()?.parse().ok()?, id: fields.next()?.to_string() });
+    }
     if let Some(rest) = line.strip_prefix("EDIT\t") {
         let mut fields = rest.splitn(3, '\t');
         return Some(Command::Edit { chat: fields.next()?.parse().ok()?, id: fields.next()?.to_string(), text: fields.next()?.to_string() });
@@ -104,6 +114,12 @@ fn parse_command(line: &str) -> Option<Command> {
 pub fn clock_at(unix_seconds: i64) -> String {
     let day = (unix_seconds + BRASILIA_OFFSET_SECONDS).rem_euclid(86_400);
     format!("{:02}:{:02}", day / 3600, day % 3600 / 60)
+}
+
+/// The `time` field of `MSG` and `PAST`: the time of day and, after a space, the calendar day (days
+/// since 1970-01-01, Brasilia time), which the ui turns into the chip above the day's messages.
+pub fn stamp_at(unix_seconds: i64) -> String {
+    format!("{} {}", clock_at(unix_seconds), (unix_seconds + BRASILIA_OFFSET_SECONDS).div_euclid(86_400))
 }
 
 pub fn clock() -> String {
@@ -153,6 +169,8 @@ mod tests {
     fn a_react_line_may_carry_an_empty_emoji_to_take_the_reaction_back() {
         assert!(matches!(parse_command("REACT\t01\tABC\t👍"), Some(Command::React { chat: 1, id, emoji }) if id == "ABC" && emoji == "👍"));
         assert!(matches!(parse_command("REACT\t2\tABC\t"), Some(Command::React { emoji, .. }) if emoji.is_empty()));
+        assert!(matches!(parse_command("THUMB\t02\tABC"), Some(Command::Thumb { chat: 2, id }) if id == "ABC"));
+        assert!(matches!(parse_command("OLDER\t03\tABC"), Some(Command::Older { chat: 3, id }) if id == "ABC"));
         assert!(matches!(parse_command("EDIT\t01\tABC\tnovo texto"), Some(Command::Edit { chat: 1, id, text }) if id == "ABC" && text == "novo texto"));
         assert!(matches!(parse_command("MUTE\t02\t1"), Some(Command::Mute { chat: 2, muted: true })));
         assert!(matches!(parse_command("DELETECHAT\t05"), Some(Command::DeleteChat { chat: 5 })));
@@ -177,6 +195,8 @@ mod tests {
     #[test]
     fn the_clock_shows_brasilia_time() {
         assert_eq!(clock_at(0), "21:00");
+        assert_eq!(stamp_at(0), "21:00 -1");
+        assert_eq!(stamp_at(3 * 3600), "00:00 0");
         assert_eq!(clock_at(15 * 3600 + 30 * 60), "12:30");
         assert_eq!(clock_at(3 * 3600), "00:00");
     }

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::audio;
 use crate::call::{Audio, Calls, Event, Outcome};
 use crate::contacts::ContactBook;
-use crate::link::{clock, commands, contacts_reply, say, Command};
+use crate::link::{clock, commands, contacts_reply, say, stamp_at, Command};
 use crate::trim;
 
 const DELIVERED_AFTER: Duration = Duration::from_millis(500);
@@ -36,8 +36,12 @@ const CHATS: [(&str, &str, u8); 8] = [
 /// (message, the message it answers): history entries that quote an earlier one.
 const QUOTED: [(usize, usize); 2] = [(12, 11), (14, 13)];
 
+/// (history entry, kind, width, height, label): entries that carry a photo, video, voice or document.
+/// Kinds are the ones of the `MEDIA` line: 1 photo, 2 video, 3 voice, 4 document.
+const MEDIA: [(usize, u8, u32, u32, &str); 4] = [(30, 1, 1600, 1200, ""), (31, 2, 1280, 720, "0:24"), (32, 3, 0, 0, "0:12"), (33, 4, 0, 0, "Cardápio da semana.pdf")];
+
 /// (conversation, sent by me, text, time)
-const HISTORY: [(usize, bool, &str, &str); 30] = [
+const HISTORY: [(usize, bool, &str, &str); 34] = [
     (0, false, "Oi! Vamos almoçar hoje?", "12:31"),
     (0, true, "Bora! Onde você quer ir?", "12:33"),
     (0, false, "Aquele restaurante perto do escritório, o de comida por quilo que abriu semana passada.", "12:35"),
@@ -68,6 +72,10 @@ const HISTORY: [(usize, bool, &str, &str); 30] = [
     (6, false, "Seu pedido saiu para entrega", "Sáb"),
     (7, false, "Kkkkk 🤣", "Sex"),
     (7, true, "Verdade!", "Sex"),
+    (1, false, "Olha como ficou a mesa", "11:01"),
+    (1, false, "", "11:01"),
+    (1, true, "", "11:02"),
+    (1, false, "", "11:03"),
 ];
 
 const FAVORITES: [&str; 3] = ["Mãe", "Bruno", "Grupo da faculdade"];
@@ -118,6 +126,9 @@ fn opening_lines() -> Vec<Vec<String>> {
         let (outgoing, read) = if outgoing { ("1", "1") } else { ("0", "0") };
         let reply = QUOTED.iter().find(|(message, _)| *message == number).map_or(String::new(), |(_, quoted)| format!("d{quoted}"));
         lines.push(["MSG", &chat.to_string(), outgoing, read, time, &format!("d{number}"), &reply, text].map(String::from).to_vec());
+        if let Some(&(_, kind, width, height, label)) = MEDIA.iter().find(|entry| entry.0 == number) {
+            lines.push(["MEDIA", &chat.to_string(), &format!("d{number}"), &kind.to_string(), &width.to_string(), &height.to_string(), label].map(String::from).to_vec());
+        }
     }
     // Reactions to show: one person's on something I said, mine plus another's on something they said.
     lines.push(["REACTIONS", "0", "d1", "", "👍:1"].map(String::from).to_vec());
@@ -179,6 +190,8 @@ pub fn run() {
     let commands = commands();
     let mut calls = Calls::new();
     let mut extra_chats: Vec<String> = Vec::new();
+    // How many pages of older messages each conversation has given (the demo has two to give).
+    let mut older_pages = [0u8; 64];
     let mut sent = 0;
     let mut book = ContactBook::new();
     for name in CONTACTS {
@@ -226,6 +239,34 @@ pub fn run() {
                 }
             }
             Ok(Command::Delete { chat, id }) => eprintln!("[demo] deleted {id} in chat {chat}"),
+            Ok(Command::Thumb { chat, id }) => {
+                // A soft diagonal gradient, warm in one corner: a stand-in for the preview picture.
+                let (width, height) = (48usize, 36usize);
+                send(&["THUMB".to_string(), chat.to_string(), id.clone(), width.to_string(), height.to_string()]);
+                for row in 0..height {
+                    let hex: String = (0..width)
+                        .map(|column| {
+                            let (r, g, b) = (90 + column * 3, 70 + row * 3 + column, 160 - row * 2);
+                            let packed = ((r.min(255) >> 3) << 11 | (g.min(255) >> 2) << 5 | (b.min(255) >> 3)) as u16;
+                            format!("{:02x}{:02x}", packed & 0xff, packed >> 8)
+                        })
+                        .collect();
+                    send(&["THUMBROW".to_string(), chat.to_string(), id.clone(), row.to_string(), hex]);
+                }
+            }
+            Ok(Command::Older { chat, .. }) => {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs() as i64);
+                let page = older_pages.get_mut(chat).map_or(2, |pages| std::mem::replace(pages, pages.saturating_add(1)));
+                if page < 2 {
+                    // Newest first: each goes before the conversation's first message.
+                    for n in (0..6).rev() {
+                        let number = page as usize * 6 + n;
+                        let outgoing = if number % 3 == 0 { "1" } else { "0" };
+                        send(&["PAST".to_string(), chat.to_string(), outgoing.to_string(), "1".to_string(), stamp_at(now - (page as i64 * 7 + 2) * 86_400), format!("old{chat}_{number}"), String::new(), format!("Mensagem antiga {}", number + 1)]);
+                    }
+                }
+                send(&["PASTEND".to_string(), chat.to_string(), if page < 1 { "1" } else { "0" }.to_string()]);
+            }
             Ok(Command::Edit { chat, id, text }) => eprintln!("[demo] {id} in chat {chat} edited to {text:?}"),
             Ok(Command::Mute { chat, muted }) => eprintln!("[demo] chat {chat} muted: {muted}"),
             Ok(Command::DeleteChat { chat }) => eprintln!("[demo] chat {chat} deleted"),
@@ -234,6 +275,7 @@ pub fn run() {
             Ok(Command::Star { chat, id, starred }) => eprintln!("[demo] {} {id} in chat {chat}", if starred { "starred" } else { "unstarred" }),
             Ok(Command::React { chat, id, emoji }) => eprintln!("[demo] reaction {emoji:?} on {id} in chat {chat}"),
             Ok(Command::OpenChat { name }) => {
+                let name = if name.is_empty() { "Você".to_string() } else { name };
                 // A contact without a conversation gets an empty one, after the eight that exist.
                 let id = CHATS.len() + extra_chats.iter().position(|known| *known == name).unwrap_or_else(|| {
                     extra_chats.push(name.clone());
@@ -278,8 +320,8 @@ mod tests {
     use super::*;
 
     /// The ui stores these in fixed arrays; anything larger would be cut.
-    const UI_MAX_CHATS: usize = 16;
-    const UI_MAX_MESSAGES: usize = 128;
+    const UI_MAX_CHATS: usize = 48;
+    const UI_MAX_MESSAGES: usize = 384;
     const UI_NAME: usize = 40;
     const UI_STATUS: usize = 48;
     const UI_MESSAGE: usize = 240;

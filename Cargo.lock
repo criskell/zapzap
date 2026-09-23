@@ -596,7 +596,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -914,6 +914,12 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jpeg-decoder"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
 
 [[package]]
 name = "js-sys"
@@ -1301,7 +1307,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1614,7 +1620,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1894,8 +1900,6 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "wacore"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6139a98fece24956f1d6bf164c82c5daefb43834813d96a879b41e010707c2c2"
 dependencies = [
  "aes",
  "anyhow",
@@ -1942,8 +1946,6 @@ dependencies = [
 [[package]]
 name = "wacore-appstate"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5afb5372c68d1cda49b7e86a81a01302b7c71b78e8555178c7cf3be01f09ecc3"
 dependencies = [
  "anyhow",
  "buffa",
@@ -1964,8 +1966,6 @@ dependencies = [
 [[package]]
 name = "wacore-binary"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e56452f93ac1e6167a6ebafec23971fe1ca9332b27cc887520f4a6753956fde"
 dependencies = [
  "bytes",
  "compact_str",
@@ -1982,8 +1982,6 @@ dependencies = [
 [[package]]
 name = "wacore-derive"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53cba66b01df4bef777c3d131af434dea0f3c8a7da2e42d7fb74e11fd65fb094"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1993,8 +1991,6 @@ dependencies = [
 [[package]]
 name = "wacore-libsignal"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbf8e90eebdf77703305089c1dfe672dddf203e0238e8f47163f76e7f9d5c713"
 dependencies = [
  "aes",
  "async-lock",
@@ -2025,8 +2021,6 @@ dependencies = [
 [[package]]
 name = "wacore-noise"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a15b03c1e5e4bbf20d2d875c96649aaff82d149f025ae3a1421a1b6a9c426114"
 dependencies = [
  "anyhow",
  "buffa",
@@ -2044,8 +2038,6 @@ dependencies = [
 [[package]]
 name = "waproto"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd19a927d4781e92382a478d234f74baeacb4822ceeb45c665bb9cb321622c35"
 dependencies = [
  "buffa",
  "buffa-build",
@@ -2119,8 +2111,6 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cb354c32641cfe832bf5c5767a016762234c5efd1b4ce979e2b3e32175d96bc"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2155,10 +2145,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "whatsapp-rust-chat-store"
+version = "0.1.0"
+dependencies = [
+ "buffa",
+ "chrono",
+ "diesel",
+ "diesel_migrations",
+ "log",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "wacore",
+ "wacore-binary",
+ "waproto",
+ "whatsapp-rust-sqlite-storage",
+]
+
+[[package]]
 name = "whatsapp-rust-sqlite-storage"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee70216db150b33c1c7cb01dc81e37f70b3edf8c24cebcd75a7ade5c011720d1"
 dependencies = [
  "async-trait",
  "buffa",
@@ -2178,8 +2184,6 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-tokio-transport"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02ae442f8a6e747c777225ce1808f2ce5311963cf2dccb17a1f304c749f01832"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2199,8 +2203,6 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-ureq-http-client"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ebb64db9f84faa5eddb851ba7f44566363523bbdb88d5772fcc7d168e177797"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2358,8 +2360,10 @@ name = "zapzap-engine"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "jpeg-decoder",
  "tokio",
  "whatsapp-rust",
+ "whatsapp-rust-chat-store",
  "zapzap-core",
 ]
 

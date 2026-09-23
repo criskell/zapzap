@@ -725,6 +725,12 @@ fn new_chat_sidebar(c: &mut Canvas, side: i32, chat: &Chat) {
                 fitted(c, RAIL_W + 88, y + 30, NAME, TEXT_PRIMARY, text, side - 20 - (RAIL_W + 88));
                 font::draw(c, RAIL_W + 88, y + 54, PREVIEW, TEXT_SECONDARY, "Mensagens para mim");
             }
+            ContactsItem::Number => {
+                contact_photo(c, RAIL_W + 48, y + 36, 1);
+                let mut label = [0u8; 64];
+                let text = join(&mut label, &["Conversar com ", chat.search.text()]);
+                fitted(c, RAIL_W + 88, y + 41, NAME, TEXT_PRIMARY, text, side - 20 - (RAIL_W + 88));
+            }
             ContactsItem::Letter(letter) => {
                 let mut utf8 = [0u8; 4];
                 font::draw(c, RAIL_W + 27, y + 45, PREVIEW, TEXT_SECONDARY, letter.encode_utf8(&mut utf8));
@@ -1050,7 +1056,7 @@ fn hover_button_center(chat: &Chat, index: usize, window_w: i32) -> Option<(i32,
             return;
         }
         let quote_width = chat.quote_width_of(message);
-        let shape = bubble_shape(message.text(), message.time(), message.outgoing, message.starred, chat.text_limit(), quote_width);
+        let shape = bubble_shape(message.text(), message.time(), message.outgoing, message.starred, chat.text_limit(), quote_width, message.block());
         let width = shape.width + 2 * BUBBLE_PAD_X;
         let left = if message.outgoing { window_w - BUBBLE_MARGIN - 4 - width } else { side + BUBBLE_MARGIN };
         let cx = if message.outgoing { left - 24 } else { left + width + 24 };
@@ -1161,7 +1167,7 @@ pub fn message_at(chat: &Chat, x: i32, y: i32, window_w: i32) -> Option<usize> {
     let mut found = None;
     chat.place(|message, at, _| {
         let quote_width = chat.quote_width_of(message);
-        let shape = bubble_shape(message.text(), message.time(), message.outgoing, message.starred, chat.text_limit(), quote_width);
+        let shape = bubble_shape(message.text(), message.time(), message.outgoing, message.starred, chat.text_limit(), quote_width, message.block());
         let width = shape.width + 2 * BUBBLE_PAD_X;
         let left = if message.outgoing { window_w - BUBBLE_MARGIN - 4 - width } else { side + BUBBLE_MARGIN };
         let (from, to) = (top + at, top + at + shape.height);
@@ -1209,7 +1215,7 @@ pub fn quote_at(chat: &Chat, x: i32, y: i32, window_w: i32) -> Option<usize> {
     chat.place(|message, at, _| {
         let Some(quoted) = chat.quoted_by(message) else { return };
         let quote_width = chat.quote_width_of(message);
-        let shape = bubble_shape(message.text(), message.time(), message.outgoing, message.starred, chat.text_limit(), quote_width);
+        let shape = bubble_shape(message.text(), message.time(), message.outgoing, message.starred, chat.text_limit(), quote_width, message.block());
         let width = shape.width + 2 * BUBBLE_PAD_X;
         let left = if message.outgoing { window_w - BUBBLE_MARGIN - 4 - width } else { side + BUBBLE_MARGIN };
         let (bx, by) = (left + 6, top + at + 6);
@@ -1609,8 +1615,9 @@ fn conversation_row(c: &mut Canvas, side: i32, y: i32, index: usize, chat: &Chat
     avatar(c, RAIL_W + 48, y + ROW_H / 2, 24, AVATAR_COLORS[index % AVATAR_COLORS.len()], info.name());
 
     let last = chat.last_message(index);
-    let time = last.map_or(info.time(), |message| message.time());
-    let preview = last.map_or("", |message| message.text());
+    let mut day_buffer = [0u8; 10];
+    let time = last.map_or(info.time(), |message| crate::chat::list_day(message.day, message.time(), &mut day_buffer));
+    let preview = last.map_or("", |message| if message.text().is_empty() { message.kind_word() } else { message.text() });
     let unread = info.unread > 0;
     let text_x = RAIL_W + 86;
     let time_w = font::measure(time, META);
@@ -1690,13 +1697,19 @@ fn conversation(c: &mut Canvas, x0: i32, chat: &Chat) {
     c.fill_rect(x0, 0, w, c.h, BG_CHAT);
     let content_top = HEADER_H - chat.conversation_scroll;
 
-    let chip = "HOJE";
-    let chip_w = font::measure(chip, META) + 24;
-    c.fill_round_rect(x0 + w / 2 - chip_w / 2, content_top + 14, chip_w, 26, 8, BG_CHIP);
-    centered(c, x0 + w / 2, content_top + 31, META, TEXT_SECONDARY, chip);
-
     let text_limit = chat.text_limit();
-    let content = chat.place(|message, y, starts_run| bubble(c, x0, content_top + y, message, starts_run, text_limit, chat));
+    let mut chip_day = None;
+    let content = chat.place(|message, y, starts_run| {
+        if chip_day != Some(message.day) {
+            chip_day = Some(message.day);
+            day_chip(c, x0, w, content_top + y - crate::chat::DAY_CHIP_ROW, message.day);
+        }
+        bubble(c, x0, content_top + y, message, starts_run, text_limit, chat)
+    });
+    // A conversation without messages still says what day it is.
+    if chip_day.is_none() {
+        day_chip(c, x0, w, content_top + crate::chat::CONVERSATION_TOP - crate::chat::DAY_CHIP_ROW, crate::chat::today());
+    }
 
     let info = chat.conversation(chat.selected);
     c.fill_rect(x0, 0, w, HEADER_H, BG_SIDEBAR);
@@ -1770,7 +1783,7 @@ pub fn in_picker(x: i32, y: i32, window_w: i32, window_h: i32) -> bool {
 
 fn bubble(c: &mut Canvas, x0: i32, y: i32, message: &crate::chat::Message, starts_run: bool, text_limit: i32, chat: &Chat) {
     let quote_width = chat.quote_width_of(message);
-    let shape = bubble_shape(message.text(), message.time(), message.outgoing, message.starred, text_limit, quote_width);
+    let shape = bubble_shape(message.text(), message.time(), message.outgoing, message.starred, text_limit, quote_width, message.block());
     // The reactions pill hangs below the bubble, so its rows count too.
     if y >= c.y0 + c.rows || y + shape.height + crate::chat::REACTION_H <= c.y0 {
         return;
@@ -1807,6 +1820,13 @@ fn bubble(c: &mut Canvas, x0: i32, y: i32, message: &crate::chat::Message, start
         }
         None => 0,
     };
+    let (_, block_h) = message.block();
+    let quote_offset = if block_h > 0 {
+        media_block(c, x + BUBBLE_PAD_X, y + BUBBLE_PAD_Y + quote_offset, width - 2 * BUBBLE_PAD_X, block_h, message, chat);
+        quote_offset + block_h + crate::chat::BLOCK_GAP
+    } else {
+        quote_offset
+    };
     for (index, line) in font::lines(message.text(), BODY, text_limit).enumerate() {
         let baseline = y + BUBBLE_PAD_Y + 14 + quote_offset + index as i32 * LINE_HEIGHT;
         // What the find bar looks for is marked behind the text.
@@ -1836,6 +1856,97 @@ fn bubble(c: &mut Canvas, x0: i32, y: i32, message: &crate::chat::Message, start
         icons::draw(c, ticks_x, baseline - 13, icon, tick);
     }
     reactions_pill(c, x, y + shape.height, width, message);
+}
+
+/// The box of what a message carries besides text: the preview picture of a photo or video (a plain
+/// box until it arrives), a voice message's player, a document's name.
+fn media_block(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, message: &crate::chat::Message, chat: &Chat) {
+    use crate::chat::{MEDIA_AUDIO, MEDIA_DOCUMENT};
+    if y >= c.y0 + c.rows || y + h <= c.y0 {
+        return;
+    }
+    let inside = if message.outgoing { 0x0f3a2b } else { 0x1b1d1d };
+    match message.kind {
+        MEDIA_AUDIO => {
+            c.fill_round_rect(x, y, w, h, 8, inside);
+            c.fill_circle(x + 24, y + h / 2, 16, TEXT_SECONDARY);
+            // The play triangle.
+            for column in 0..10 {
+                let half = (10 - column) * 6 / 10;
+                c.fill_rect(x + 19 + column, y + h / 2 - half, 1, 2 * half + 1, inside);
+            }
+            c.fill_rect(x + 52, y + h / 2, w - 68, 2, TEXT_SECONDARY);
+            c.fill_circle(x + 52, y + h / 2 + 1, 4, TEXT_SECONDARY);
+            font::draw(c, x + 52, y + h - 6, META, TEXT_SECONDARY, message.label());
+        }
+        MEDIA_DOCUMENT => {
+            c.fill_round_rect(x, y, w, h, 8, inside);
+            icons::draw_centered(c, x + 28, y + h / 2, Icon::Description, TEXT_SECONDARY);
+            fitted(c, x + 54, y + h / 2 + 5, BODY, TEXT_PRIMARY, message.label(), w - 66);
+        }
+        kind => {
+            c.fill_round_rect(x, y, w, h, 6, 0x232626);
+            match chat.thumb_of(message) {
+                Some((pixels, tw, th)) => draw_thumb(c, x, y, w, h, pixels, tw, th),
+                None => centered(c, x + w / 2, y + h / 2 + 5, PREVIEW, TEXT_SECONDARY, message.kind_word()),
+            }
+            if kind == crate::chat::MEDIA_VIDEO {
+                c.fill_circle(x + w / 2, y + h / 2, 22, 0x161717);
+                for column in 0..14 {
+                    let half = (14 - column) * 9 / 14;
+                    c.fill_rect(x + w / 2 - 6 + column, y + h / 2 - half, 1, 2 * half + 1, TEXT_PRIMARY);
+                }
+                let label = message.label();
+                let chip = font::measure(label, META) + 12;
+                c.fill_round_rect(x + 6, y + h - 24, chip, 18, 6, 0x161717);
+                font::draw(c, x + 12, y + h - 10, META, TEXT_PRIMARY, label);
+            }
+        }
+    }
+}
+
+/// `pixels` (RGB565 rows `THUMB_SIDE` apart, `tw` by `th` in use) stretched over the box, smoothed, with
+/// the corners left out so they show the rounded box beneath.
+fn draw_thumb(c: &mut Canvas, x: i32, y: i32, w: i32, h: i32, pixels: &[u16], tw: usize, th: usize) {
+    const RADIUS: i32 = 6;
+    let side = crate::chat::THUMB_SIDE;
+    let unpack = |p: u16| ((p >> 11) as u32 * 255 / 31, ((p >> 5) & 63) as u32 * 255 / 63, (p & 31) as u32 * 255 / 31);
+    for row in y.max(c.y0)..(y + h).min(c.y0 + c.rows) {
+        let dy = row - y;
+        // Position in the picture in 1/256 pixels, from the centre of the destination pixel.
+        let fy = (((dy * 2 + 1) * th as i32 * 128 / h) - 128).clamp(0, (th as i32 - 1) * 256);
+        let (y0, wy) = ((fy >> 8) as usize, (fy & 255) as u32);
+        let y1 = (y0 + 1).min(th - 1);
+        for dx in 0..w {
+            let (cx, cy) = (dx.min(w - 1 - dx), dy.min(h - 1 - dy));
+            if cx < RADIUS && cy < RADIUS && (RADIUS - cx - 1).pow(2) + (RADIUS - cy - 1).pow(2) > RADIUS * RADIUS {
+                continue;
+            }
+            let fx = (((dx * 2 + 1) * tw as i32 * 128 / w) - 128).clamp(0, (tw as i32 - 1) * 256);
+            let (x0, wx) = ((fx >> 8) as usize, (fx & 255) as u32);
+            let x1 = (x0 + 1).min(tw - 1);
+            let (a, b, cc, d) = (unpack(pixels[y0 * side + x0]), unpack(pixels[y0 * side + x1]), unpack(pixels[y1 * side + x0]), unpack(pixels[y1 * side + x1]));
+            let mix = |pa: u32, pb: u32, pc: u32, pd: u32| {
+                let top = pa * (256 - wx) + pb * wx;
+                let bottom = pc * (256 - wx) + pd * wx;
+                (top * (256 - wy) + bottom * wy) >> 16
+            };
+            let color = mix(a.0, b.0, cc.0, d.0) << 16 | mix(a.1, b.1, cc.1, d.1) << 8 | mix(a.2, b.2, cc.2, d.2);
+            c.put(x + dx, row, color);
+        }
+    }
+}
+
+/// The chip that opens a day, `top` being the top of its row.
+fn day_chip(c: &mut Canvas, x0: i32, w: i32, top: i32, day: u16) {
+    if top + crate::chat::DAY_CHIP_ROW < c.y0 || top > c.y0 + c.rows {
+        return;
+    }
+    let mut buffer = [0u8; 10];
+    let label = crate::chat::day_chip(day, &mut buffer);
+    let chip_w = font::measure(label, META) + 24;
+    c.fill_round_rect(x0 + w / 2 - chip_w / 2, top + 14, chip_w, 26, 8, BG_CHIP);
+    centered(c, x0 + w / 2, top + 31, META, TEXT_SECONDARY, label);
 }
 
 /// The pill of the footer: attach and emoji buttons, the text, and the mic or send button, all inside.
@@ -1912,6 +2023,8 @@ pub enum Hit {
     Call(usize),
     Back,
     Contact(usize),
+    SelfChat,
+    NumberChat,
     Starred(usize),
     FindOpen,
     ChatMenu,
@@ -2028,9 +2141,12 @@ pub fn hit_test(x: i32, y: i32, window_w: i32, window_h: i32, chat: &Chat) -> Hi
         let mut hit = Hit::Nothing;
         chat.contacts_place(|item, top| {
             let top = top - chat.panel_scroll;
-            if let ContactsItem::Contact(index) = item {
-                if y >= CALLS_VIEW_TOP && y >= top && y < top + NEW_CHAT_ROW_H {
-                    hit = Hit::Contact(index);
+            if y >= CALLS_VIEW_TOP && y >= top && y < top + NEW_CHAT_ROW_H {
+                match item {
+                    ContactsItem::Contact(index) => hit = Hit::Contact(index),
+                    ContactsItem::Myself => hit = Hit::SelfChat,
+                    ContactsItem::Number => hit = Hit::NumberChat,
+                    _ => {}
                 }
             }
         });

@@ -15,12 +15,21 @@ use whatsapp_rust::wacore::proto_helpers::{build_quote_context_with_info, Messag
 use whatsapp_rust::wacore_binary::JidExt;
 use whatsapp_rust::wacore::types::call::{CallAction, IncomingCall};
 use whatsapp_rust::wacore::types::events::EventKind;
+use whatsapp_rust_chat_store::ChatStore;
+mod media;
+
+use media::{media_of, Media};
 use zapzap_core::audio;
 use zapzap_core::call::{Audio, Calls, Event as CallEvent, Lines};
 use zapzap_core::contacts::ContactBook;
 use zapzap_core::reactions::{Reactions, ME};
-use zapzap_core::link::{clock_at, commands, contacts_reply, say, Command};
+use zapzap_core::link::{clock_at, commands, stamp_at, contacts_reply, say, Command};
 use zapzap_core::trim;
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
 
 /// SQLite's page cache, per connection (its default is 512).
 const SQLITE_CACHE_KIB: u32 = 64;
@@ -31,8 +40,11 @@ const UI_CONTACTS: usize = 40;
 /// Messages of a history conversation the ui shows.
 const MESSAGES_PER_CHAT: usize = 8;
 
+/// Entries the LID/PN mapping cache may hold.
+const LID_PN_CACHE: u64 = 512;
+
 /// The ui keeps this many conversations.
-const MAX_CHATS: usize = 16;
+const MAX_CHATS: usize = 48;
 
 /// What the engine remembers between events.
 struct State {
@@ -49,6 +61,10 @@ struct State {
     reactions: Reactions,
     /// Chats the ui dropped: a new message brings them back.
     removed: Vec<usize>,
+    /// Conversations, messages and contacts kept on disk, like WhatsApp Web's own database.
+    history: Option<Arc<ChatStore>>,
+    /// Conversations for which the phone was already asked for older messages (once each per run).
+    asked_phone: Vec<usize>,
 }
 
 /// A message kept so that an answer to it can quote it.
@@ -101,6 +117,11 @@ fn audio_state() -> Audio {
 }
 
 fn data_directory() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from)?;
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"))?;
+    #[cfg(not(any(windows, target_os = "macos")))]
     let base = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))?;
     Some(base.join("zapzap"))
 }
@@ -160,7 +181,8 @@ async fn on_message(shared: Shared, context: MessageContext) {
         }
         return;
     }
-    let Some(text) = context.message.text_content() else { return };
+    let media = media_of(&context.message);
+    let Some(text) = context.message.text_content().or_else(|| media.as_ref().map(|media| media.caption.as_str())) else { return };
     let info = &context.info;
     let mut state = shared.lock().expect("state");
     // Only the other side's push name names a chat; ours would name it after ourselves.
@@ -168,9 +190,17 @@ async fn on_message(shared: Shared, context: MessageContext) {
     let Some(chat) = chat_number(&mut state, &info.source.chat, name) else { return };
     let id = info.id.to_string();
     state.remember(&info.source.chat, &id, &info.source.sender, info.source.is_from_me, text);
-    let time = clock_at(info.timestamp.timestamp());
+    let time = stamp_at(info.timestamp.timestamp());
     let outgoing = if info.source.is_from_me { "1" } else { "0" };
     say(&["MSG", &chat.to_string(), outgoing, "0", &time, &id, &replied_id(&context.message), text]);
+    if let Some(media) = &media {
+        say_media(&chat.to_string(), &id, media);
+    }
+}
+
+/// Tells the ui that message `id` of chat `chat` carries `media` (`MEDIA` follows the `MSG`/`PAST` line).
+fn say_media(chat: &str, id: &str, media: &Media) {
+    say(&["MEDIA", chat, id, &media.kind.to_string(), &media.width.to_string(), &media.height.to_string(), &media.label]);
 }
 
 /// What the ui needs of a history conversation: it keeps few, and each with only its last messages.
@@ -189,6 +219,7 @@ struct HistoryMessage {
     id: String,
     reply: String,
     text: String,
+    media: Option<Media>,
 }
 
 /// Reads a history-sync chunk one conversation at a time (never the whole inflated blob at once, which
@@ -213,12 +244,14 @@ fn recent_from_history(sync: &whatsapp_rust::wacore::types::events::LazyHistoryS
                 let info = entry.message.as_option()?;
                 let message = info.message.as_option()?;
                 let key = info.key.as_option();
+                let media = media_of(message);
                 Some(HistoryMessage {
                     from_me: key.is_some_and(|key| key.from_me.unwrap_or(false)),
                     at: info.message_timestamp.unwrap_or(0),
                     id: key.and_then(|key| key.id.clone()).unwrap_or_default(),
                     reply: replied_id(message),
-                    text: message.text_content()?.to_string(),
+                    text: message.text_content().or_else(|| media.as_ref().map(|media| media.caption.as_str()))?.to_string(),
+                    media,
                 })
             })
             .collect();
@@ -250,9 +283,204 @@ fn show_history(state: &mut State, recents: Vec<Recent>, own: Option<Jid>) {
             // Who wrote a history message is not known here beyond "me or the chat": enough to quote it.
             let sender = if message.from_me { own.clone().unwrap_or_else(|| recent.jid.clone()) } else { recent.jid.clone() };
             state.remember(&recent.jid, &message.id, &sender, message.from_me, &message.text);
-            say(&["MSG", &chat, if message.from_me { "1" } else { "0" }, "0", &clock_at(message.at as i64), &message.id, &message.reply, &message.text]);
+            say(&["MSG", &chat, if message.from_me { "1" } else { "0" }, "0", &stamp_at(message.at as i64), &message.id, &message.reply, &message.text]);
+            if let Some(media) = &message.media {
+                say_media(&chat, &message.id, media);
+            }
         }
     }
+}
+
+/// What a message without text shows in a conversation: its kind in a word.
+fn kind_label(kind: &whatsapp_rust_chat_store::MessageKind) -> Option<&'static str> {
+    use whatsapp_rust_chat_store::MessageKind as Kind;
+    Some(match kind {
+        Kind::Image => "Foto",
+        Kind::Video | Kind::VideoNote => "Vídeo",
+        Kind::Audio | Kind::VoiceNote => "Áudio",
+        Kind::Sticker => "Figurinha",
+        Kind::Document => "Documento",
+        Kind::Contact => "Contato",
+        Kind::Location => "Localização",
+        Kind::Poll => "Enquete",
+        _ => return None,
+    })
+}
+
+/// A stored message as the ui shows it: its text, else its kind in a word; deleted ones say so.
+fn history_message(message: whatsapp_rust_chat_store::StoredMessage) -> Option<HistoryMessage> {
+    let media = message.message.as_deref().and_then(media_of).filter(|_| !message.revoked);
+    let text = if message.revoked {
+        "Esta mensagem foi apagada".to_string()
+    } else if let Some(media) = &media {
+        media.caption.clone()
+    } else {
+        message.text.clone().filter(|text| !text.is_empty()).or_else(|| kind_label(&message.kind).map(str::to_string))?
+    };
+    Some(HistoryMessage {
+        from_me: message.from_me,
+        at: message.timestamp.timestamp().max(0) as u64,
+        id: message.id.clone(),
+        reply: message.message.as_deref().map(replied_id).unwrap_or_default(),
+        text,
+        media,
+    })
+}
+
+/// The embedded preview of message `id`, as `THUMB` and one `THUMBROW` per row of pixels (each row is
+/// hex of RGB565, small enough for one protocol line); `THUMBFAIL` when there is none.
+async fn send_thumbnail(shared: &Shared, chat: usize, id: &str) {
+    let number = chat.to_string();
+    let (store, jid) = {
+        let state = shared.lock().expect("state");
+        (state.history.clone(), state.chats.get(chat).map(|(jid, _)| jid.clone()))
+    };
+    let found = match (store, jid) {
+        (Some(store), Some(jid)) => {
+            // What just arrived may still be on its way to the disk.
+            let _ = store.flush().await;
+            store.message(&jid, id).await.ok().flatten()
+        }
+        _ => None,
+    };
+    let decoded = found.and_then(|stored| stored.message).and_then(|message| media::thumbnail_of(&message).and_then(media::decode_thumbnail));
+    let Some((width, height, pixels)) = decoded else {
+        say(&["THUMBFAIL", &number, id]);
+        return;
+    };
+    say(&["THUMB", &number, id, &width.to_string(), &height.to_string()]);
+    for (row, bytes) in pixels.chunks(width * 2).enumerate() {
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        say(&["THUMBROW", &number, id, &row.to_string(), &hex]);
+    }
+}
+
+/// How many older messages one `OLDER` brings.
+const OLDER_PAGE: i64 = 16;
+
+/// The ui scrolled to the top of chat `chat`: sends the messages before `id` that are on disk, newest
+/// first (each goes before the conversation's first, so they end up in order), or asks the phone for more.
+async fn send_older(shared: &Shared, client: &Arc<Client>, chat: usize, id: &str) {
+    let (store, jid) = {
+        let state = shared.lock().expect("state");
+        (state.history.clone(), state.chats.get(chat).map(|(jid, _)| jid.clone()))
+    };
+    let (Some(store), Some(jid)) = (store, jid) else {
+        say(&["PASTEND", &chat.to_string(), "0"]);
+        return;
+    };
+    let Ok(Some(anchor)) = store.message(&jid, id).await else {
+        say(&["PASTEND", &chat.to_string(), "0"]);
+        return;
+    };
+    let page = store.messages(&jid, Some(whatsapp_rust_chat_store::MessageCursor::from(&anchor)), OLDER_PAGE).await.unwrap_or_default();
+    let full_page = page.len() as i64 == OLDER_PAGE;
+    let number = chat.to_string();
+    let own = client.pn();
+    for stored in page {
+        let from_me = stored.from_me;
+        let sender = if from_me { own.clone().unwrap_or_else(|| jid.clone()) } else { jid.clone() };
+        let Some(message) = history_message(stored) else { continue };
+        shared.lock().expect("state").remember(&jid, &message.id, &sender, from_me, &message.text);
+        say(&["PAST", &number, if from_me { "1" } else { "0" }, "0", &stamp_at(message.at as i64), &message.id, &message.reply, &message.text]);
+        if let Some(media) = &message.media {
+            say_media(&number, &message.id, media);
+        }
+    }
+    if full_page {
+        say(&["PASTEND", &number, "1"]);
+        return;
+    }
+    // Nothing older on disk: ask the phone, once per conversation, for the messages before this one.
+    // They arrive as a history sync, land on disk, and the next scroll to the top finds them.
+    {
+        let mut state = shared.lock().expect("state");
+        if state.asked_phone.contains(&chat) {
+            drop(state);
+            say(&["PASTEND", &number, "0"]);
+            return;
+        }
+        state.asked_phone.push(chat);
+    }
+    let asked = client.fetch_message_history(&jid, id, anchor.from_me, anchor.timestamp.timestamp_millis(), 50).await;
+    if let Err(error) = &asked {
+        eprintln!("older messages request failed: {error}");
+    }
+    say(&["PASTEND", &number, if asked.is_ok() { "1" } else { "0" }]);
+}
+
+/// The conversations kept on disk, freshest first, each with its last messages, as the ui shows them.
+async fn stored_history(store: &ChatStore, client: Option<&Arc<Client>>) -> Vec<Recent> {
+    let chats = match store.chats(false, MAX_CHATS as i64).await {
+        Ok(chats) => chats,
+        Err(error) => {
+            eprintln!("stored chats failed: {error}");
+            return Vec::new();
+        }
+    };
+    let mut recents = Vec::new();
+    for entry in chats {
+        if entry.jid.is_status_broadcast() {
+            continue;
+        }
+        let mut stored = store.messages(&entry.jid, None, MESSAGES_PER_CHAT as i64).await.unwrap_or_default();
+        stored.reverse();
+        let messages = stored.into_iter().filter_map(history_message).collect();
+        let name = display_name(store, client, &entry.jid, entry.name.clone()).await;
+        recents.push(Recent {
+            timestamp: entry.last_message_at.map_or(0, |at| at.timestamp().max(0) as u64),
+            jid: entry.jid,
+            name,
+            unread: entry.unread_count.max(0) as u32,
+            messages,
+        });
+    }
+    recents
+}
+
+/// The name a conversation shows: the one it was stored with, else the contact's, else (for someone
+/// known by a LID) the contact behind the phone number, else the number itself.
+async fn display_name(store: &ChatStore, client: Option<&Arc<Client>>, jid: &Jid, stored: Option<String>) -> String {
+    let usable = |name: Option<String>| name.filter(|name| !name.trim().is_empty());
+    let contact_name = |contact: whatsapp_rust_chat_store::ContactEntry| usable([contact.full_name, contact.first_name, contact.push_name, contact.business_name].into_iter().flatten().find(|name| !name.trim().is_empty()));
+    if let Some(name) = usable(stored) {
+        return name;
+    }
+    if let Ok(Some(contact)) = store.contact(jid).await {
+        if let Some(name) = contact_name(contact) {
+            return name;
+        }
+    }
+    let mut number = jid.is_pn().then(|| jid.user.to_string());
+    if jid.is_lid() {
+        if let Some(entry) = client {
+            if let Ok(Some(mapping)) = entry.get_lid_pn_entry(jid).await {
+                let pn = Jid::pn(&*mapping.phone_number);
+                if let Ok(Some(contact)) = store.contact(&pn).await {
+                    if let Some(name) = contact_name(contact) {
+                        return name;
+                    }
+                }
+                number = Some(mapping.phone_number.to_string());
+            }
+        }
+    }
+    match number {
+        Some(number) => format!("+{number}"),
+        None if jid.is_group() => "Grupo".to_string(),
+        None => String::new(),
+    }
+}
+
+/// Shows what is on disk when the connection comes up (the ui was just reset, so the numbers start over).
+async fn load_history(shared: &Shared, client: &Arc<Client>) {
+    let Some(store) = shared.lock().expect("state").history.clone() else { return };
+    let recents = stored_history(&store, Some(client)).await;
+    let mut state = shared.lock().expect("state");
+    state.chats.clear();
+    state.recent.clear();
+    state.removed.clear();
+    show_history(&mut state, recents, client.pn());
 }
 
 /// "visto por último hoje às 09:48", from Brasilia calendar days.
@@ -323,12 +551,6 @@ async fn on_event(shared: Shared, event: Arc<whatsapp_rust::wacore::types::event
                 say(&["STARRED", &chat.to_string(), &update.message_id, if update.action.starred.unwrap_or(false) { "1" } else { "0" }]);
             }
         }
-        Event::ContactUpdate(update) => {
-            let name = update.action.full_name.as_deref().filter(|name| !name.is_empty()).or(update.action.first_name.as_deref());
-            if let Some(name) = name {
-                state.book.insert_with_id(name, Some(&update.jid.to_string()));
-            }
-        }
         Event::SelfPushNameUpdated(update) => say(&["PROFILE", &update.new_name]),
         Event::IncomingCall(call) => {
             let is_voice = matches!(call.action, CallAction::Offer { is_video: false, group_jid: None, .. });
@@ -373,9 +595,14 @@ async fn send_text(shared: &Shared, client: &Arc<Client>, chat: usize, text: Str
         Some(context) => wa::Message::text_with_context(text.clone(), context),
         None => wa::Message::text(text.clone()),
     };
+    let stored = message.clone();
     match client.send_message(&jid, message).await {
         Ok(sent) => {
             say(&["SENT", &chat.to_string(), &sent.message_id]);
+            let history = shared.lock().expect("state").history.clone();
+            if let Some(history) = history {
+                let _ = history.record_outgoing(&jid, sent.message_id.clone(), &stored, whatsapp_rust::wacore::time::now_utc());
+            }
             if let Some(own) = client.pn() {
                 shared.lock().expect("state").remember(&jid, &sent.message_id, &own, true, &text);
             }
@@ -462,11 +689,17 @@ async fn serve_commands(shared: Shared, client: Arc<Client>, mut commands: mpsc:
                 let jid = shared.lock().expect("state").chats.get(chat).map(|(jid, _)| jid.clone());
                 let Some(jid) = jid else { continue };
                 let content = wa::Message { conversation: Some(text), ..Default::default() };
+                let history = shared.lock().expect("state").history.clone();
+                if let Some(history) = &history {
+                    let _ = history.record_edit(&jid, &id, &content, whatsapp_rust::wacore::time::now_utc());
+                }
                 if let Err(error) = client.edit_message(jid, id, content).await {
                     eprintln!("edit failed: {error}");
                     say(&["STATUS", "Não foi possível editar a mensagem."]);
                 }
             }
+            Command::Older { chat, id } => send_older(&shared, &client, chat, &id).await,
+            Command::Thumb { chat, id } => send_thumbnail(&shared, chat, &id).await,
             Command::MarkRead { chat } => {
                 let jid = shared.lock().expect("state").chats.get(chat).map(|(jid, _)| jid.clone());
                 let Some(jid) = jid else { continue };
@@ -493,20 +726,62 @@ async fn serve_commands(shared: Shared, client: Arc<Client>, mut commands: mpsc:
             Command::Delete { chat, id } => {
                 let jid = shared.lock().expect("state").chats.get(chat).map(|(jid, _)| jid.clone());
                 let Some(jid) = jid else { continue };
+                let history = shared.lock().expect("state").history.clone();
+                if let Some(history) = &history {
+                    let _ = history.record_revoke(&jid, &id, whatsapp_rust::wacore::time::now_utc());
+                }
                 if let Err(error) = client.revoke_message(jid, id, whatsapp_rust::send::RevokeType::Sender).await {
                     eprintln!("delete failed: {error}");
                     say(&["STATUS", "Não foi possível apagar a mensagem."]);
                 }
             }
             Command::Contacts { query } => {
-                let state = shared.lock().expect("state");
-                let found = state.book.search(&query, UI_CONTACTS);
-                tell_ui(contacts_reply(&found));
+                let history = shared.lock().expect("state").history.clone();
+                let mut all = ContactBook::new();
+                if let Some(history) = history {
+                    match history.contact_names().await {
+                        Ok(names) => names.iter().for_each(|(jid, name)| all.insert_with_id(name, Some(jid))),
+                        Err(error) => eprintln!("contacts failed: {error}"),
+                    }
+                }
+                // Only the matches stay in memory, with the ids that let the ui open a conversation.
+                let found: Vec<(String, Option<String>)> = all.search(&query, UI_CONTACTS).into_iter().map(|name| (name.to_string(), all.id_of(name).map(str::to_string))).collect();
+                drop(all);
+                let mut state = shared.lock().expect("state");
+                state.book = ContactBook::new();
+                for (name, id) in &found {
+                    state.book.insert_with_id(name, id.as_deref());
+                }
+                let names: Vec<&str> = found.iter().map(|(name, _)| name.as_str()).collect();
+                tell_ui(contacts_reply(&names));
             }
             Command::OpenChat { name } => {
+                let is_number = name.len() >= 8 && name.bytes().all(|b| b.is_ascii_digit());
+                let (jid, shown) = if name.is_empty() {
+                    // An empty name is the conversation with ourselves.
+                    (client.pn().map(|own| own.to_non_ad()), "Você".to_string())
+                } else if is_number {
+                    // A phone number: the server says which account it is (or that there is none).
+                    match client.contacts().is_on_whatsapp(&[Jid::pn(name.as_str())]).await {
+                        Ok(found) => match found.into_iter().find(|entry| entry.is_registered) {
+                            Some(entry) => (Some(entry.jid.to_non_ad()), format!("+{name}")),
+                            None => {
+                                say(&["STATUS", "Este número não está no WhatsApp."]);
+                                continue;
+                            }
+                        },
+                        Err(error) => {
+                            eprintln!("number lookup failed: {error}");
+                            say(&["STATUS", "Não foi possível procurar este número."]);
+                            continue;
+                        }
+                    }
+                } else {
+                    let state = shared.lock().expect("state");
+                    (state.book.id_of(&name).and_then(|id| id.parse::<Jid>().ok()), name)
+                };
                 let mut state = shared.lock().expect("state");
-                let jid = state.book.id_of(&name).and_then(|id| id.parse::<Jid>().ok());
-                if let Some(chat) = jid.and_then(|jid| chat_number(&mut state, &jid, &name)) {
+                if let Some(chat) = jid.and_then(|jid| chat_number(&mut state, &jid, &shown)) {
                     say(&["SHOWCHAT", &chat.to_string()]);
                 }
             }
@@ -557,15 +832,28 @@ async fn run() {
         }
     };
 
-    let shared: Shared = Arc::new(Mutex::new(State { calls: Calls::new(), ringing: None, chats: Vec::new(), recent: Vec::new(), book: ContactBook::new(), reactions: Reactions::default(), removed: Vec::new() }));
-    let (message_state, event_state) = (shared.clone(), shared.clone());
+    let history = match ChatStore::new(&store).await {
+        Ok(history) => Some(history),
+        Err(error) => {
+            eprintln!("cannot open the history store: {error}");
+            None
+        }
+    };
+    let shared: Shared = Arc::new(Mutex::new(State { calls: Calls::new(), ringing: None, chats: Vec::new(), recent: Vec::new(), book: ContactBook::new(), reactions: Reactions::default(), removed: Vec::new(), history: history.clone(), asked_phone: Vec::new() }));
+    let (message_state, event_state, connected_state) = (shared.clone(), shared.clone(), shared.clone());
     let bot = Bot::builder()
         .with_backend(store)
+        // The LID/PN cache is unbounded by default and held thousands of contacts (about 4 MiB); the rest is
+        // read from the database on demand.
+        .with_cache_config(whatsapp_rust::CacheConfig { lid_pn_cache: whatsapp_rust::CacheEntryConfig::new(None, LID_PN_CACHE), ..Default::default() })
         .on_qr_code(|code, _timeout| async move { say(&["QR", &code]) })
-        .on_connected(|_client| async {
-            say(&["RESET"]);
-            say(&["OPEN"]);
-            say(&["STATUS", "Conectado. Carregando as conversas recentes..."]);
+        .on_connected(move |client| {
+            let state = connected_state.clone();
+            async move {
+                say(&["RESET"]);
+                say(&["OPEN"]);
+                load_history(&state, &client).await;
+            }
         })
         .on_logged_out(|_info| async { say(&["NOTICE", "Este aparelho foi desconectado da conta. Reinicie para parear de novo."]) })
         .on_message(move |context| on_message(message_state.clone(), context))
@@ -606,19 +894,27 @@ async fn run() {
             }
         }
     });
+    // What arrives and what syncs is written to disk as it happens; the subscription lives as long as `run`.
+    let _history_subscription = history.as_ref().map(|history| bot.client().subscribe_handler(history.handler()));
     tokio::spawn(serve_commands(shared, bot.client(), receiver));
-    // Start-up code is done with once the client runs: let go of the code pages that are idle, now
-    // and every half minute, so the resident set follows what the process actually executes.
+    // The resident set follows what the process actually executes (`trim::keep_trimmed`); the heap is
+    // handed back here.
     tokio::spawn(async {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            trim::drop_idle_code();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // The history sync leaves the allocator holding tens of megabytes it no longer uses.
+            // SAFETY: `malloc_trim` only hands free heap pages back to the kernel.
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            unsafe {
+                malloc_trim(0)
+            };
         }
     });
     bot.run().await;
 }
 
 fn main() {
+    trim::keep_trimmed();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("async runtime");
     runtime.block_on(run());
 }
@@ -715,7 +1011,7 @@ mod tests {
     #[test]
     fn only_the_latest_messages_are_kept_for_quoting_and_ids_are_needed() {
         let jid: Jid = "5511000000001@s.whatsapp.net".parse().unwrap();
-        let mut state = State { calls: Calls::new(), ringing: None, chats: Vec::new(), recent: Vec::new(), book: ContactBook::new(), reactions: Reactions::default(), removed: Vec::new() };
+        let mut state = State { calls: Calls::new(), ringing: None, chats: Vec::new(), recent: Vec::new(), book: ContactBook::new(), reactions: Reactions::default(), removed: Vec::new(), history: None, asked_phone: Vec::new() };
         for n in 0..(QUOTABLE + 10) {
             state.remember(&jid, &format!("id{n}"), &jid, false, "texto");
         }
@@ -727,7 +1023,7 @@ mod tests {
     #[test]
     fn long_quoted_texts_are_cut() {
         let jid: Jid = "5511000000001@s.whatsapp.net".parse().unwrap();
-        let mut state = State { calls: Calls::new(), ringing: None, chats: Vec::new(), recent: Vec::new(), book: ContactBook::new(), reactions: Reactions::default(), removed: Vec::new() };
+        let mut state = State { calls: Calls::new(), ringing: None, chats: Vec::new(), recent: Vec::new(), book: ContactBook::new(), reactions: Reactions::default(), removed: Vec::new(), history: None, asked_phone: Vec::new() };
         state.remember(&jid, "x", &jid, false, &"a".repeat(1000));
         assert_eq!(state.recent[0].text.chars().count(), QUOTED_TEXT);
     }
@@ -750,9 +1046,9 @@ mod tests {
 
     #[test]
     fn the_ui_learns_each_conversation_once() {
-        let mut state = State { calls: Calls::new(), ringing: None, chats: Vec::new(), recent: Vec::new(), book: ContactBook::new(), reactions: Reactions::default(), removed: Vec::new() };
+        let mut state = State { calls: Calls::new(), ringing: None, chats: Vec::new(), recent: Vec::new(), book: ContactBook::new(), reactions: Reactions::default(), removed: Vec::new(), history: None, asked_phone: Vec::new() };
         let jid: Jid = "5511000000001@s.whatsapp.net".parse().unwrap();
-        let recent = || Recent { timestamp: 1, jid: jid.clone(), name: "Ana".into(), unread: 1, messages: vec![HistoryMessage { from_me: false, at: 1, id: "A1".into(), reply: String::new(), text: "oi".into() }] };
+        let recent = || Recent { timestamp: 1, jid: jid.clone(), name: "Ana".into(), unread: 1, messages: vec![HistoryMessage { from_me: false, at: 1, id: "A1".into(), reply: String::new(), text: "oi".into(), media: None }] };
         show_history(&mut state, vec![recent()], None);
         show_history(&mut state, vec![recent()], None);
         assert_eq!(state.chats.len(), 1);

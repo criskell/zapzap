@@ -1,0 +1,1301 @@
+diff --git a/src/send/mod.rs b/src/send/mod.rs
+index 7910668..d5f98e9 100644
+--- a/src/send/mod.rs
++++ b/src/send/mod.rs
+@@ -645,15 +645,10 @@ fn has_renderable_envelope(im: &wa::message::InteractiveMessage) -> bool {
+ /// the message used to leave without a `<biz>` at all — accepted, acked, and
+ /// then invisible on the handset. A `shopStorefrontMessage` is excluded, as it
+ /// is in WA Web.
+-fn classify_interactive(im: &wa::message::InteractiveMessage) -> Option<BizCategory<'_>> {
+-    use wa::message::interactive_message::InteractiveMessage as Payload;
+-    match im.interactive_message.as_ref()? {
+-        Payload::NativeFlowMessage(nf) if !nf.buttons.is_empty() => {
+-            nf.buttons.first()?.name.as_deref().map(classify_button)
+-        }
+-        Payload::ShopStorefrontMessage(_) => None,
+-        _ => has_renderable_envelope(im).then_some(BizCategory::Mixed),
+-    }
++fn classify_interactive(_im: &wa::message::InteractiveMessage) -> Option<BizCategory<'_>> {
++    // This fork never sends interactive (business button) messages, so their payload types are not
++    // compiled in and nothing has to be announced for them.
++    None
+ }
+ 
+ /// Derive the `<biz>` stanza child for interactive messages.
+diff --git a/storages/chat-store/src/queries.rs b/storages/chat-store/src/queries.rs
+index 12baa25..5315c93 100644
+--- a/storages/chat-store/src/queries.rs
++++ b/storages/chat-store/src/queries.rs
+@@ -466,6 +466,31 @@ impl ChatStore {
+         ))
+     }
+ 
++    /// Every contact that has a name, as `(jid, name)`: the saved name first, then the first name, the
++    /// name the person set for themselves, and the business name. For a contact picker that filters
++    /// on its own; nothing is kept after the call.
++    pub async fn contact_names(&self) -> Result<Vec<(String, String)>> {
++        use schema::contacts::dsl;
++        let device_id = self.device_id();
++        let rows: Vec<ContactRow> = self
++            .db()
++            .read(move |conn| {
++                dsl::contacts
++                    .filter(dsl::device_id.eq(device_id))
++                    .select((dsl::jid, dsl::push_name, dsl::full_name, dsl::first_name, dsl::business_name))
++                    .load(conn)
++                    .map_err(db_err)
++            })
++            .await?;
++        Ok(rows
++            .into_iter()
++            .filter_map(|(jid, push_name, full_name, first_name, business_name)| {
++                let name = [full_name, first_name, push_name, business_name].into_iter().flatten().find(|name| !name.trim().is_empty())?;
++                Some((jid, name))
++            })
++            .collect())
++    }
++
+     /// Sum of positive unread counters (ignores "marked unread" sentinels).
+     pub async fn unread_total(&self) -> Result<i64> {
+         use schema::chats::dsl;
+diff --git a/storages/sqlite-storage/src/sqlite_store.rs b/storages/sqlite-storage/src/sqlite_store.rs
+index 22e6d28..0c59597 100644
+--- a/storages/sqlite-storage/src/sqlite_store.rs
++++ b/storages/sqlite-storage/src/sqlite_store.rs
+@@ -127,6 +127,9 @@ pub struct SqliteStore {
+     device_id: i32,
+ }
+ 
++/// How many LID/PN mappings the cache warm-up loads.
++const LID_PN_WARM_UP_LIMIT: i64 = 256;
++
+ /// `PRAGMA synchronous` durability level for a store's connections.
+ #[derive(Debug, Clone, Copy)]
+ pub enum Synchronous {
+@@ -2735,6 +2738,9 @@ impl ProtocolStore for SqliteStore {
+                     lid_pn_mapping::updated_at,
+                 ))
+                 .filter(lid_pn_mapping::device_id.eq(device_id))
++                // Only warms the in-memory cache: the newest mappings, the rest is read on demand.
++                .order(lid_pn_mapping::updated_at.desc())
++                .limit(LID_PN_WARM_UP_LIMIT)
+                 .load(&mut conn)
+                 .map_err(|e| StoreError::Database(Box::new(e)))?;
+             Ok(rows
+diff --git a/wacore/src/types/events.rs b/wacore/src/types/events.rs
+index 4744488..6e2e677 100755
+--- a/wacore/src/types/events.rs
++++ b/wacore/src/types/events.rs
+@@ -1124,6 +1124,7 @@ impl fmt::Debug for Event {
+ #[derive(Debug, Clone, Serialize, bon::Builder)]
+ #[non_exhaustive]
+ pub struct InboundMessage {
++    #[serde(skip)]
+     pub message: Arc<wa::Message>,
+     pub info: Arc<MessageInfo>,
+ }
+@@ -1821,6 +1822,7 @@ pub struct ContactUpdate {
+     /// The chat/contact this sync action applies to.
+     pub jid: Jid,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::ContactAction>,
+     pub from_full_sync: bool,
+ }
+@@ -1841,6 +1843,7 @@ pub struct PinUpdate {
+     /// The chat being pinned or unpinned.
+     pub jid: Jid,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::PinAction>,
+     pub from_full_sync: bool,
+ }
+@@ -1851,6 +1854,7 @@ pub struct MuteUpdate {
+     /// The chat being muted or unmuted.
+     pub jid: Jid,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::MuteAction>,
+     pub from_full_sync: bool,
+ }
+@@ -1861,6 +1865,7 @@ pub struct ArchiveUpdate {
+     /// The chat being archived or unarchived.
+     pub jid: Jid,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::ArchiveChatAction>,
+     pub from_full_sync: bool,
+ }
+@@ -1876,6 +1881,7 @@ pub struct StarUpdate {
+     pub message_id: String,
+     pub from_me: bool,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::StarAction>,
+     pub from_full_sync: bool,
+ }
+@@ -1886,6 +1892,7 @@ pub struct MarkChatAsReadUpdate {
+     /// The chat being marked as read or unread.
+     pub jid: Jid,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::MarkChatAsReadAction>,
+     pub from_full_sync: bool,
+ }
+@@ -1898,6 +1905,7 @@ pub struct DeleteChatUpdate {
+     /// From the index, not the proto — DeleteChatAction only has messageRange.
+     pub delete_media: bool,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::DeleteChatAction>,
+     pub from_full_sync: bool,
+ }
+@@ -1913,6 +1921,7 @@ pub struct ClearChatUpdate {
+     /// From the index, not the proto.
+     pub delete_media: bool,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::ClearChatAction>,
+     pub from_full_sync: bool,
+ }
+@@ -1926,6 +1935,7 @@ pub struct UserStatusMuteUpdate {
+     /// `true` = status muted, `false` = unmuted.
+     pub muted: bool,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::UserStatusMuteAction>,
+     pub from_full_sync: bool,
+ }
+@@ -1939,6 +1949,7 @@ pub struct DeleteMessageForMeUpdate {
+     pub message_id: String,
+     pub from_me: bool,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::DeleteMessageForMeAction>,
+     pub from_full_sync: bool,
+ }
+@@ -1951,6 +1962,7 @@ pub struct LabelEditUpdate {
+     /// The label identifier (the index key, not a JID).
+     pub label_id: String,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::LabelEditAction>,
+     pub from_full_sync: bool,
+ }
+@@ -1965,6 +1977,7 @@ pub struct LabelAssociationUpdate {
+     /// The chat the label was associated with or removed from.
+     pub chat_jid: Jid,
+     pub timestamp: DateTime<Utc>,
++    #[serde(skip)]
+     pub action: Box<wa::sync_action_value::LabelAssociationAction>,
+     pub from_full_sync: bool,
+ }
+diff --git a/wacore/src/types/message.rs b/wacore/src/types/message.rs
+index cc4c643..4c34d61 100644
+--- a/wacore/src/types/message.rs
++++ b/wacore/src/types/message.rs
+@@ -358,7 +358,7 @@ pub struct MessageInfo {
+     /// Parent post key when the dispatched message is a decrypted CAG channel
+     /// comment (`enc_comment_message`). The inner `Message` proto has no slot
+     /// for the threading link, so it surfaces here.
+-    #[serde(skip_serializing_if = "Option::is_none")]
++    #[serde(skip)]
+     pub comment_target: Option<wa::MessageKey>,
+     /// Broadcast-contact-list recipients from `<participants><to jid>` on an
+     /// incoming broadcast/status stanza. Populated only for broadcasts; used to
+diff --git a/waproto/build.rs b/waproto/build.rs
+index a6bd07c..01af792 100644
+--- a/waproto/build.rs
++++ b/waproto/build.rs
+@@ -59,6 +59,8 @@ fn main() -> std::io::Result<()> {
+     println!("cargo:rerun-if-changed=src/whatsapp.desc.sha256");
+     println!("cargo:rerun-if-changed=src/whatsapp.proto");
+     println!("cargo:rerun-if-changed=build.rs");
++    println!("cargo:rerun-if-changed=keep.txt");
++    println!("cargo:rerun-if-changed=keep_fields.txt");
+ 
+     ensure_proto_descriptor_hash()?;
+ 
+@@ -70,6 +72,7 @@ fn main() -> std::io::Result<()> {
+     let mut fds = FileDescriptorSet::decode_from_slice(&std::fs::read("src/whatsapp.desc")?)
+         .map_err(std::io::Error::other)?;
+     apply_local_fields(&mut fds)?;
++    prune_unused(&mut fds)?;
+ 
+     // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
+     generate_tags(&fds, &out_path.join("tags.rs"))?;
+@@ -99,65 +102,12 @@ fn main() -> std::io::Result<()> {
+         // unknown as numbers), so the message-level enums under the
+         // serde-enum-repr JS-bridge contract stay closed.
+         .open_enums_in(&[".whatsapp.SyncdMutation.SyncdOperation"])
+-        // Keep the opened field on the closed-enum serde contracts
+-        // (serde-enum-repr numbers, serde-snake-case lowercase); see
+-        // crate::open_enum_serde.
+-        .field_attribute(
+-            ".whatsapp.SyncdMutation.operation",
+-            "#[serde(serialize_with = \"crate::open_enum_serde::serialize\")]",
+-        )
+-        .field_attribute(
+-            ".whatsapp.SyncdMutation.operation",
+-            "#[cfg_attr(feature = \"serde-deserialize\", serde(deserialize_with = \"crate::open_enum_serde::deserialize\"))]",
+-        )
+         // Box every singular message field. buffa defaults them to inline; for
+         // WhatsApp's deep, many-optional-field messages (every message variant
+         // is its own inline slot) that makes size_of explode recursively,
+         // turning decode and Vec growth into large struct memcpys. Box keeps
+         // the structs pointer-sized.
+         .box_type(buffa_build::PointerRepr::Box)
+-        // Messages + oneofs: serde over the struct/oneof shape. Serialize always;
+-        // Deserialize only for the WASM bridge (halves serde codegen).
+-        .message_attribute(".", "#[derive(serde::Serialize)]")
+-        .message_attribute(
+-            ".",
+-            "#[cfg_attr(feature = \"serde-deserialize\", derive(serde::Deserialize))]",
+-        )
+-        .message_attribute(
+-            ".",
+-            "#[cfg_attr(feature = \"serde-deserialize\", serde(default))]",
+-        )
+-        .oneof_attribute(".", "#[derive(serde::Serialize)]")
+-        .oneof_attribute(
+-            ".",
+-            "#[cfg_attr(feature = \"serde-deserialize\", derive(serde::Deserialize))]",
+-        )
+-        // Enums: variant name by default; numeric repr (prost parity, JS bridge)
+-        // under `serde-enum-repr`. Targeting enums separately from oneofs needs
+-        // buffa's enum_attribute/oneof_attribute split.
+-        .enum_attribute(
+-            ".",
+-            "#[cfg_attr(not(feature = \"serde-enum-repr\"), derive(serde::Serialize))]",
+-        )
+-        .enum_attribute(
+-            ".",
+-            "#[cfg_attr(feature = \"serde-enum-repr\", derive(serde_repr::Serialize_repr))]",
+-        )
+-        .enum_attribute(
+-            ".",
+-            "#[cfg_attr(all(feature = \"serde-deserialize\", not(feature = \"serde-enum-repr\")), derive(serde::Deserialize))]",
+-        )
+-        .enum_attribute(
+-            ".",
+-            "#[cfg_attr(all(feature = \"serde-deserialize\", feature = \"serde-enum-repr\"), derive(serde_repr::Deserialize_repr))]",
+-        )
+-        // buffa emits SCREAMING_SNAKE variant names (CHROME, MESSAGE_EDIT), so
+-        // `lowercase` yields the intended chrome / message_edit. `snake_case`
+-        // would insert a separator before every char (c_h_r_o_m_e).
+-        .enum_attribute(
+-            ".",
+-            "#[cfg_attr(all(feature = \"serde-snake-case\", not(feature = \"serde-enum-repr\")), serde(rename_all(deserialize = \"lowercase\")))]",
+-        )
+         // O(1)-clone Bytes for hot-path crypto structures instead of Vec<u8>.
+         .use_bytes_type_in(&[
+             ".whatsapp.SessionStructure.Chain.ChainKey",
+@@ -166,43 +116,6 @@ fn main() -> std::io::Result<()> {
+             ".whatsapp.SenderKeyStateStructure.SenderMessageKey",
+             ".whatsapp.SenderKeyStateStructure.SenderSigningKey",
+         ])
+-        // Bytes fields lack serde support; skip them (internal crypto state).
+-        .field_attribute(
+-            ".whatsapp.SessionStructure.Chain.ChainKey.key",
+-            "#[serde(skip)]",
+-        )
+-        .field_attribute(
+-            ".whatsapp.SessionStructure.Chain.MessageKey.cipherKey",
+-            "#[serde(skip)]",
+-        )
+-        .field_attribute(
+-            ".whatsapp.SessionStructure.Chain.MessageKey.macKey",
+-            "#[serde(skip)]",
+-        )
+-        .field_attribute(
+-            ".whatsapp.SessionStructure.Chain.MessageKey.iv",
+-            "#[serde(skip)]",
+-        )
+-        .field_attribute(
+-            ".whatsapp.SessionStructure.Chain.MessageKey.seed",
+-            "#[serde(skip)]",
+-        )
+-        .field_attribute(
+-            ".whatsapp.SenderKeyStateStructure.SenderChainKey.seed",
+-            "#[serde(skip)]",
+-        )
+-        .field_attribute(
+-            ".whatsapp.SenderKeyStateStructure.SenderMessageKey.seed",
+-            "#[serde(skip)]",
+-        )
+-        .field_attribute(
+-            ".whatsapp.SenderKeyStateStructure.SenderSigningKey.public",
+-            "#[serde(skip)]",
+-        )
+-        .field_attribute(
+-            ".whatsapp.SenderKeyStateStructure.SenderSigningKey.private",
+-            "#[serde(skip)]",
+-        )
+         // We control both encoder and decoder — no need to preserve unknown
+         // fields. Disabling removes __buffa_unknown_fields from every struct,
+         // eliminating allocation/drop overhead in nested types like
+@@ -217,6 +130,71 @@ fn main() -> std::io::Result<()> {
+     Ok(())
+ }
+ 
++/// Drops every top-level message and enum that `keep.txt` (the types the client uses) cannot reach
++/// through a field, so the generated code holds only what a build actually needs. A field whose type
++/// was dropped never happens: everything a kept type mentions is kept with it.
++fn prune_unused(fds: &mut FileDescriptorSet) -> std::io::Result<()> {
++    use std::collections::{HashMap, HashSet};
++
++    // `.whatsapp.Foo.Bar.baz` names the top-level type `Foo`.
++    fn top_level(type_name: &str) -> Option<&str> {
++        type_name.strip_prefix(".whatsapp.")?.split('.').next()
++    }
++    fn mentions(message: &DescriptorProto, out: &mut Vec<String>) {
++        for field in &message.field {
++            if let Some(name) = field.type_name.as_deref().and_then(top_level) {
++                out.push(name.to_owned());
++            }
++        }
++        for nested in &message.nested_type {
++            mentions(nested, out);
++        }
++    }
++
++    // A message-typed field nobody reads by name is dropped (its wire bytes are skipped when decoding),
++    // which takes its whole sub-tree of message kinds with it once nothing else mentions them.
++    {
++        use heck::ToSnakeCase as _;
++        let used: HashSet<String> = std::fs::read_to_string("keep_fields.txt")?.lines().map(str::to_owned).collect();
++        fn drop_fields(message: &mut DescriptorProto, used: &HashSet<String>) {
++            message.field.retain(|field| {
++                let is_message = field.r#type == Some(field_descriptor_proto::Type::TYPE_MESSAGE);
++                !is_message || used.contains(&field.name.as_deref().unwrap_or_default().to_snake_case())
++            });
++            for nested in &mut message.nested_type {
++                drop_fields(nested, used);
++            }
++        }
++        for file in &mut fds.file {
++            for message in &mut file.message_type {
++                drop_fields(message, &used);
++            }
++        }
++    }
++
++    let keep = std::fs::read_to_string("keep.txt")?;
++    let mut pending: Vec<String> = keep.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
++    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
++    for file in &fds.file {
++        for message in &file.message_type {
++            let mut out = Vec::new();
++            mentions(message, &mut out);
++            edges.insert(message.name.clone().unwrap_or_default(), out);
++        }
++    }
++    let mut reached: HashSet<String> = HashSet::new();
++    while let Some(name) = pending.pop() {
++        if reached.insert(name.clone()) {
++            pending.extend(edges.get(&name).cloned().unwrap_or_default());
++        }
++    }
++    for file in &mut fds.file {
++        file.message_type.retain(|m| reached.contains(m.name.as_deref().unwrap_or_default()));
++        file.enum_type.retain(|e| reached.contains(e.name.as_deref().unwrap_or_default()));
++    }
++    Ok(())
++}
++
+ /// Splice [`LOCAL_FIELDS`] into the descriptor decoded from `whatsapp.desc`.
+ ///
+ /// Fails rather than resolves when upstream already occupies the name or the
+diff --git a/waproto/keep.txt b/waproto/keep.txt
+new file mode 100644
+index 0000000..2d5b4d8
+--- /dev/null
++++ b/waproto/keep.txt
+@@ -0,0 +1,91 @@
++ADVDeviceIdentity
++ADVEncryptionType
++ADVKeyIndexList
++ADVSignedDeviceIdentity
++ADVSignedDeviceIdentityHMAC
++ADVSignedKeyIndexList
++Account
++BotMetadata
++CallLogRecord
++CertChain
++ChatLockSettings
++ClientPairingProps
++ClientPayload
++CollectionName
++Command
++CompanionCommitment
++CompanionEphemeralIdentity
++Config
++ContextInfo
++Conversation
++DeviceCapabilities
++DeviceProps
++DisappearingMode
++EncryptedPairingRequest
++EphemeralSetting
++EventResponse
++ExternalBlobReference
++Field
++GroupHistory
++GroupMention
++GroupParticipant
++HandshakeMessage
++HistorySync
++HistorySyncMsg
++IdentityKeyPairStructure
++KeepInChat
++KeepType
++KeyId
++LIDMigrationMappingSyncMessage
++LIDMigrationMapping
++LIDMigrationMappingSyncPayload
++LimitSharing
++Location
++MediaRetryNotification
++MemberLabel
++Mention
++Message
++MessageAssociation
++MessageContextInfo
++MessageKey
++MessageSecretMessage
++NoiseCertificate
++PairingRequest
++PaymentInfo
++PhoneNumberToLIDMapping
++PinInChat
++Point
++PollEncValue
++PollUpdate
++PreKeyRecordStructure
++PreKeySignalMessage
++PrimaryEphemeralIdentity
++ProloguePayload
++Pushname
++Reaction
++RecordStructure
++ReportingTokenInfo
++RoutingInfo
++SenderKeyDistributionMessage
++SenderKeyMessage
++SenderKeyRecordStructure
++SenderKeyStateStructure
++ServerErrorReceipt
++SessionStructure
++SignalMessage
++SignedPreKeyRecordStructure
++StatusMentionMessage
++SubProtocol
++SyncActionData
++SyncActionValue
++SyncdIndex
++SyncdMutation
++SyncdMutations
++SyncdPatch
++SyncdRecord
++SyncdSnapshot
++SyncdValue
++SyncdVersion
++ThreadID
++VerifiedNameCertificate
++WebMessageInfo
+diff --git a/waproto/keep_fields.txt b/waproto/keep_fields.txt
+new file mode 100644
+index 0000000..61af467
+--- /dev/null
++++ b/waproto/keep_fields.txt
+@@ -0,0 +1,790 @@
++accepted
++accessibility_label
++accessibility_text
++accesstoken
++account_lid
++account_signature
++account_signature_key
++account_type
++accounts
++acknowledged
++action
++actual_actors
++ad_id
++address
++adv_secret
++agent_action
++agent_id
++ai_thread_rename_action
++album_message
++alice_base_key
++alignment
++allowed
++amount
++android_unsupported_actions
++app_state_sync_key_request
++app_state_sync_key_share
++app_version
++appeal_status
++appeal_update_time
++archive_chat_action
++archived
++assigned_lid
++associated_child_message
++association_type
++audio
++audio_message
++author
++author_jid
++avatar_updated_action
++axolotl_sender_key_distribution_message
++background
++background_argb
++backup_id
++banner_notification_display_mode
++base_key
++bitrate
++biz_ai_settings_nudge_action
++biz_jid
++blob
++body
++bot_invoke_message
++bot_jid
++bot_message_secret
++bot_metadata
++bot_welcome_request_action
++broadcast
++browser
++build_hash
++business_broadcast_campaign_action
++business_broadcast_insights_action
++business_broadcast_list_action
++button
++button_params_json
++buttons
++buttons_message
++buttons_response_message
++calendar
++call
++call_id
++call_key
++call_link
++call_log_action
++call_log_record
++call_result
++call_type
++campaign_id
++cancel_payment_request_message
++capabilities
++caption
++cards
++carousel_message
++catalog
++category
++chain_key
++channel_jid
++chat
++chat_assignment
++chat_assignment_opened_status
++chat_db_migration_timestamp
++chat_jid
++chat_lock_settings
++chunk_order
++cipher_key
++ciphertext
++clause_type
++clauses
++clear_chat_action
++client_finish
++client_hello
++code
++collection_message
++collection_name
++color
++commands
++comment
++commitment
++companion_ephemeral_identity
++companion_identity_key
++companion_public_key
++complete_on_demand_ready
++component
++conditional_reveal_message
++connect_reason
++connect_type
++consumer_lid
++contact
++contact_action
++contact_message
++contact_type
++contacts
++contacts_array_message
++content
++content_text
++content_type
++contents
++context
++context_info
++conversation
++conversation_timestamp
++conversations
++correct_answer
++count
++counter
++country
++country_code
++created_at
++created_at_ms
++creation_time
++creator_name
++credential_id
++ctwa_per_customer_data_sharing_action
++currency
++current_index
++current_session
++custom_payment_methods
++custom_payment_methods_action
++customer_data_action
++data
++date_time
++day_of_week
++debug
++decline_payment_request_message
++default
++definition
++degrees_latitude
++degrees_longitude
++delete_chat_action
++delete_media
++delete_message_for_me_action
++deleted
++description
++destination_jid
++details
++detected_outcomes_status_action
++device
++device_capabilities
++device_id
++device_index
++device_indexes
++device_jid
++device_list_metadata_version
++device_pairing_data
++device_props
++device_sent_message
++device_signature
++device_type
++direct_path
++disable_link_previews
++disappearing_mode
++display_name
++document
++document_message
++document_with_caption_message
++duration
++duration_secs
++e_ident
++e_keytype
++e_regid
++e_skey_id
++e_skey_sig
++e_skey_val
++edit_message
++edit_type
++edited_message
++email
++emoji
++emojis
++enabled
++enc_comment_message
++enc_event_response_message
++enc_iv
++enc_key
++enc_payload
++enc_reaction_message
++encoded_mapping_payload
++encoding
++encrypted_payload
++encryption_version
++end_time
++entry_point
++ephemeral
++ephemeral_expiration
++ephemeral_message
++ephemeral_setting_timestamp
++epoch
++epoch_id
++error
++event_cover_image
++event_creation_message_key
++event_message
++event_response_message
++event_type
++expiration
++expiration_date
++expiration_time
++expires
++expressions
++extended_text_message
++external_mutations
++external_web_beta_action
++extra_guest_count
++extra_guests_allowed
++fact
++fallback
++fast_ratchet_key_sender_key_distribution_message
++favorites
++favorites_action
++fbid
++features
++file_enc_sha256
++file_length
++file_name
++file_sha256
++file_size_bytes
++filehash
++filename
++filter_name
++filter_result
++filters
++fingerprint
++first_name
++flags
++flow_id
++font
++footer
++force_refresh
++format
++forwarding_score
++four_row_template
++frequency
++from_me
++full_name
++full_sync_days_limit
++future_proof
++galaxy_flow_action
++generation
++gif_playback
++group_id
++group_invite_message
++group_jid
++group_mentioned_message
++group_mentions
++group_name
++group_status_mention_message
++group_status_message
++group_status_message_v2
++group_subject
++group_type
++grouping_key
++handle
++has_media_attachment
++hash
++header
++height
++history_sync_config
++history_sync_notification
++history_sync_on_demand_request
++hmac
++host_storage
++hour
++hydrated_content_text
++hydrated_footer_text
++hydrated_four_row_template
++hydrated_template
++id
++identifier
++identity_key
++ignore
++image
++image_data_hash
++image_message
++index
++initial_hist_bootstrap_inline_payload
++initiator
++inline_initial_payload_in_e2_ee_msg
++interactive_message
++interactive_message_action
++interactive_response_message
++intermediate
++invite_code
++invite_link_group_type
++is_active
++is_animated
++is_call_link
++is_canceled
++is_chat_db_lid_migrated
++is_default_subgroup
++is_enabled
++is_forwarded
++is_live
++is_lottie
++is_message
++is_parent_group
++is_platform_changed
++is_schedule_call
++is_video
++issuer
++issuer_serial
++items
++iteration
++iv
++jid
++join_link
++jpeg_thumbnail
++keep_in_chat
++keep_in_chat_message
++keep_type
++key
++key_data
++key_expiration
++key_id
++key_ids
++key_index
++keys
++kind
++kyber_ciphertext
++kyber_pre_key_id
++label
++label_association_action
++label_edit_action
++label_reordering_action
++label_timestamp
++labeled
++labels
++language
++last_message_timestamp
++last_msg_timestamp
++last_system_message_timestamp
++latest_lid
++latitude
++lc
++leaf
++length
++lg
++lid
++lid_contact_action
++lid_db_migrated
++lid_jid
++lid_migration_mapping_sync_message
++limit
++limit_sharing
++limit_sharing_message
++limit_sharing_setting_timestamp
++limit_sharing_trigger
++limit_sharing_v2
++link_state
++list_message
++list_response_message
++list_type
++live_location_message
++loc
++local_base_key
++local_base_key_private
++local_identity_key
++local_identity_key_private
++local_identity_public
++local_ratchet_key
++local_ratchet_key_private
++local_registration_id
++locale
++locale_country_iso31661_alpha2
++locale_language_iso6391
++locale_setting
++location
++location_message
++lock_chat_action
++locked
++longitude
++lottie_sticker_message
++mac
++mac_key
++manufacturer
++mark_chat_as_read_action
++marketing_message_action
++master_key
++matched_text
++mcc
++media_key
++media_key_timestamp
++media_type
++media_upload_quality
++member_label
++mentioned_jid
++mentions
++message
++message_add_on_duration_in_secs
++message_association
++message_bytes
++message_context_info
++message_history_bundle
++message_history_notice
++message_index
++message_key
++message_keys
++message_params_json
++message_range
++message_secret
++message_timestamp
++message_type
++message_version
++messages
++metadata
++mimetype
++minute
++mnc
++mode
++modes
++month
++msg_id
++msg_order_id
++multicast
++mutations
++mute_action
++mute_end_time
++mute_end_timestamp
++muted
++name
++namespace
++native_flow_message
++nct_salt
++nct_salt_sync_action
++needs_refresh
++never
++new_jid
++newsletter
++newsletter_admin_invite_message
++newsletter_admin_profile_message
++newsletter_admin_profile_message_v2
++newsletter_follower_invite_message_v2
++newsletter_jid
++nonce
++not_after
++not_before
++note
++note_edit_action
++nux_action
++offline_threading_id
++offset
++old_jid
++oldest_msg_from_me
++oldest_msg_id
++oldest_msg_timestamp_ms
++on_demand_msg_count
++on_demand_ready
++operation
++option
++option_hash
++option_name
++options
++order_id
++order_message
++original_image_url
++original_message_id
++original_self_author
++os
++os_build_number
++os_version
++out_contact_action
++p_hash
++pack_description
++padding
++page_count
++parameters
++params
++parent_group_jid
++parent_message_key
++participant
++participants
++passive
++password
++patch_mac
++patch_version
++payload
++payment_info
++payment_info_action
++payment_invite_message
++payment_notice
++payment_tos_action
++peer_data_operation_request_message
++peer_data_operation_request_response_message
++peer_data_operation_request_type
++peer_data_operation_result
++peer_data_request_session_id
++peer_jid
++pending_key_exchange
++pending_pre_key
++persona_id
++phash
++phone
++phone_id
++phone_number
++phone_number_to_lid_mappings
++pills
++pin_action
++pin_in_chat
++pin_in_chat_message
++pinned
++placeholder_message_resend_request
++placeholder_message_resend_response
++platform
++platform_type
++plugin_type
++pn
++pn_for_lid_chat_action
++pn_jid
++pn_to_lid_mappings
++poll_content_type
++poll_creation_message
++poll_creation_message_key
++poll_creation_message_v2
++poll_creation_message_v3
++poll_creation_message_v4
++poll_creation_message_v5
++poll_creation_option_image_message
++poll_options
++poll_result_snapshot_message
++poll_result_snapshot_message_v3
++poll_type
++poll_update_message
++poll_vote
++pre_key_id
++preview_type
++previous_counter
++previous_sessions
++primary
++primary_feature
++primary_version_action
++privacy_mode_ts
++privacy_setting_disable_link_previews_action
++privacy_setting_relay_all_calls
++private
++private_key
++product
++product_id
++product_message
++products
++progress
++prompt
++protocol
++protocol_message
++provider
++ptt
++ptv_message
++public
++public_key
++publisher
++pull
++push_name
++push_name_setting
++pushname
++pushnames
++quality
++question_message
++question_reply_message
++questions
++quick_reply_action
++quoted_message
++quoted_msg
++rank
++ratchet_key
++raw_id
++reaction_message
++reactions
++read
++read_only
++receiver_chains
++recipient_count
++record
++records
++ref
++registration_id
++release_channel
++remote_identity_public
++remote_jid
++remote_key_id
++remote_registration_id
++remove_recent_sticker_action
++reporting_tag
++reporting_token_info
++reporting_token_version
++request_id
++request_payment_message
++request_phone_number_message
++request_type
++requester_jid
++require_full_sync
++response
++response_code
++result
++retailer_id
++revoke
++revoked
++root_key
++row_id
++rows
++salt
++save_on_primary_addressbook
++secondary
++seconds
++secret_enc_type
++secret_encrypted_message
++secrets
++sections
++seed
++selectable_options_count
++selected_display_text
++selected_options
++send_payment_message
++sender_chain
++sender_chain_key
++sender_key_distribution_message
++sender_key_id
++sender_key_states
++sender_message_keys
++sender_ratchet_key
++sender_ratchet_key_private
++sender_signing_key
++sender_timestamp
++sender_timestamp_ms
++sequence
++sequence_number
++serial
++server_hello
++server_timestamp_ms
++session_id
++session_version
++settings_sync
++settings_sync_action
++share_own_pn
++sharing_limited
++shop_storefront_message
++shortcut
++sidecar
++signal
++signature
++signed
++signed_pre_key_id
++signing_key
++silence_reason
++size
++snapshot_mac
++source
++source_type
++sources
++spoiler_message
++stanza_id
++star_action
++starred
++start_time
++state
++static
++static_url
++status
++status_add_yours
++status_mention_message
++status_privacy
++sticker
++sticker_action
++sticker_message
++sticker_pack_id
++sticker_pack_message
++sticker_pack_origin
++sticker_pack_size
++stickers
++storage_quota_mb
++streaming_sidecar
++style
++sub_protocol
++subject
++subscriptions
++subscriptions_sync_v2_action
++subtitle
++suggestions
++support
++support_biz_hosted_msg
++support_bot_user_agent_chat_history
++support_cag_reactions_and_polls
++support_call_log_history
++support_fbid_bot_chat_history
++support_group_history
++support_hatch_history
++support_hosted_group_msg
++support_manus_history
++support_message_association
++support_recent_sync_chunk_message_count_tuning
++surface
++suspended
++sync_type
++target_message_key
++task_id
++tc_token
++tc_token_sender_timestamp
++tc_token_timestamp
++template_button_reply_message
++template_message
++terminated
++tertiary
++text
++text_argb
++thread_id
++thread_pin_action
++thumb_data
++thumbnail
++thumbnail_direct_path
++thumbnail_enc_sha256
++thumbnail_height
++thumbnail_sha256
++thumbnail_url
++thumbnail_width
++tier
++time_format_action
++timestamp
++timestamp_ms
++timezone
++title
++token
++total_amount
++transcript
++tray_icon_file_name
++trigger
++type
++unarchive_chats_setting
++unix_epoch
++unread
++unread_count
++unread_counter_badge_display_mode
++url
++use_case
++user_agent
++user_id
++user_jid
++user_status_mute_action
++username
++utm
++utm_source
++uuid
++valid_indexes
++value
++vcard
++verified_name
++version
++video
++video_message
++view_once
++view_once_message
++view_once_message_v2
++view_once_message_v2_extension
++vote
++waffle_account_link_state_action
++wasa_root_secret_action
++waveform
++web_info
++web_message_info_bytes
++web_sub_platform
++weight
++weights
++width
++x
++y
++year

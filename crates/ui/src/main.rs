@@ -97,6 +97,10 @@ fn text(bytes: &[u8]) -> Option<&str> {
 ///   `CHAT` id unread time name status define or update a conversation
 ///   `PRESENCE` chat text              only the status line under the chat's name (online, typing...)
 ///   `MSG` chat out read time id reply text  append a message (out and read are 0 or 1; id names it, reply is the id it answers, both may be empty)
+///   `PAST` chat out read time id reply text  an older message, put before the conversation's first (same fields as `MSG`)
+///   `MEDIA` chat id kind w h label   message `id` carries a photo (1), video (2), voice message (3), document (4) or sticker (5); label is a file name or a duration
+///   `THUMB` chat id w h, `THUMBROW` chat id y hex   the preview picture of a message, row by row (RGB565 little endian, hex); `THUMBFAIL` chat id when there is none
+///   `PASTEND` chat more               that is all for the last `OLDER`; more is 1 when older ones may still exist
 ///   `REVOKED` chat id by_me           the message was deleted for everyone (by_me is 0 or 1)
 ///   `EDITED` chat id text             a message now reads `text` (edited by its sender)
 ///   `STARRED` chat id 1|0             a message was marked (1) or unmarked (0) as a favourite
@@ -243,6 +247,48 @@ fn handle_line(line: &[u8], screen: &mut Screen, notice: &mut Notice, chat: &mut
                 if let (Some(chat_id), Some(time), Some(id), Some(reply), Some(body)) = (number(chat_id), text(time), text(id), text(reply), text(body)) {
                     chat.receive(chat_id, outgoing == b"1", read == b"1", time, id, reply, body);
                 }
+            }
+        }
+        b"PAST" => {
+            let mut parts = rest.splitn(7, |&b| b == b'\t');
+            if let (Some(chat_id), Some(outgoing), Some(read), Some(time), Some(id), Some(reply), Some(body)) =
+                (parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
+            {
+                if let (Some(chat_id), Some(time), Some(id), Some(reply), Some(body)) = (number(chat_id), text(time), text(id), text(reply), text(body)) {
+                    chat.receive_older(chat_id, outgoing == b"1", read == b"1", time, id, reply, body);
+                }
+            }
+        }
+        b"MEDIA" => {
+            let mut parts = rest.splitn(6, |&b| b == b'\t');
+            if let (Some(chat_id), Some(id), Some(kind), Some(width), Some(height), Some(label)) =
+                (parts.next().and_then(number), parts.next().and_then(text), parts.next().and_then(number), parts.next().and_then(number), parts.next().and_then(number), parts.next().and_then(text))
+            {
+                chat.set_media(chat_id, id, kind as u8, width as u32, height as u32, label);
+            }
+        }
+        b"THUMB" => {
+            let mut parts = rest.splitn(4, |&b| b == b'\t');
+            if let (Some(chat_id), Some(id), Some(width), Some(height)) = (parts.next().and_then(number), parts.next().and_then(text), parts.next().and_then(number), parts.next().and_then(number)) {
+                chat.thumb_start(chat_id, id, width, height);
+            }
+        }
+        b"THUMBROW" => {
+            let mut parts = rest.splitn(4, |&b| b == b'\t');
+            if let (Some(chat_id), Some(id), Some(row), Some(hex)) = (parts.next().and_then(number), parts.next().and_then(text), parts.next().and_then(number), parts.next()) {
+                chat.thumb_row(chat_id, id, row, hex);
+            }
+        }
+        b"THUMBFAIL" => {
+            let mut parts = rest.splitn(2, |&b| b == b'\t');
+            if let (Some(chat_id), Some(id)) = (parts.next().and_then(number), parts.next().and_then(text)) {
+                chat.thumb_failed(chat_id, id);
+            }
+        }
+        b"PASTEND" => {
+            let mut parts = rest.splitn(2, |&b| b == b'\t');
+            if let (Some(chat_id), Some(more)) = (parts.next().and_then(number), parts.next()) {
+                chat.older_done(chat_id, more == b"1");
             }
         }
         b"REVOKED" => {
@@ -490,6 +536,8 @@ unsafe fn run(envp: *const *const u8) -> ! {
                                 Hit::Starred(nth) => chat.open_starred_message(nth),
                                 Hit::Back => chat.close_new_chat(),
                                 Hit::Contact(index) => chat.pick_contact(index),
+                                Hit::SelfChat => chat.pick_self(),
+                                Hit::NumberChat => chat.pick_number(),
                                 Hit::Row(index) => chat.select(index),
                                 Hit::Chip(index) => chat.set_unread_only(index == 1),
                                 Hit::SearchBox(x) => {
@@ -598,6 +646,8 @@ unsafe fn run(envp: *const *const u8) -> ! {
                 break;
             }
         }
+        chat.request_older_if_top();
+        chat.request_thumbs();
         if dirty {
             let drawn_width = (width as usize).min(MAX_WIDTH);
             let max_rows = window.max_rows(drawn_width as u32).min(BAND_ROWS);

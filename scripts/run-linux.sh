@@ -9,7 +9,8 @@ if [ "$1" = "--demo" ]; then
     core="$root/target/x86_64-unknown-linux-musl/release/zapzap-core"
     [ -x "$core" ] || core="$root/target/release/zapzap-core"
 else
-    core="$root/target/release/zapzap-engine"
+    core="$root/target/x86_64-unknown-linux-gnu/release/zapzap-engine"
+    [ -x "$core" ] || core="$root/target/release/zapzap-engine"
     [ "$1" = "--live" ] && shift
 fi
 

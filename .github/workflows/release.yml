@@ -1,0 +1,38 @@
+name: Release
+
+# Pushing a tag such as v0.1.0 builds every platform and attaches the results to a GitHub release.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Pack one archive per platform
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            case "$name" in
+              zapzap-linux-x86_64) cp "$dir"/*.tar.gz "release/$name.tar.gz" ;;
+              zapzap-windows-*) (cd "$dir" && zip -q -r "../../release/$name.zip" .) ;;
+              *) tar -czf "release/$name.tar.gz" -C "$dir" . ;;
+            esac
+          done
+          ls -l release
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
